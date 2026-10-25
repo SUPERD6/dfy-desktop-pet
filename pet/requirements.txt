@@ -1,0 +1,4 @@
+Pillow>=10
+edge-tts>=7.2
+SpeechRecognition>=3.17
+PyAudio>=0.2.14

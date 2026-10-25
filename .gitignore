@@ -1,0 +1,19 @@
+# 个人数据（永远不进公开库）
+pet/config.json
+pet/.secret_api_key
+pet/memory.json
+pet/memory.json.bak
+pet/PARTNER.md
+pet/learned_notes.md
+pet/.window_rect.json
+pet/logs/
+pet/cache/
+docs/
+# 下载/构建出来的第三方素材（各自许可，不随仓库分发）
+pet/assets/
+research/
+# Python / 杂项
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
