@@ -25,7 +25,11 @@ from pathlib import Path
 from tkinter import font as tkfont
 
 from PIL import Image, ImageDraw, ImageTk
-from interactions import DRAG_LINES, FEED_LINES, INNER_VOICE_LINES, step_flight
+from interactions import (DRAG_LINES, FEED_LINES, INNER_VOICE_LINES, render_food,
+                          state_for_actions, step_flight)
+from stickers import StickerBook
+
+CHOMP_SOUNDS = ("啊呜～咔嚓咔嚓。", "嗷呜，吧唧吧唧……", "咔嚓咔嚓，好吃！")
 
 BASE = Path(__file__).resolve().parent
 ASSETS = BASE / "assets"
@@ -392,9 +396,17 @@ class Animator:
                 pass
             self._after_id = None
 
+    # 侧身的动作素材是脸朝右的，往左走时镜像；正面的动作不翻
+    SIDE_STATES = ("walk", "sneak")
+
+    def set_facing_left(self, left: bool) -> None:
+        self.facing_left = bool(left)
+
     def _frames(self, state: str) -> list[tuple[ImageTk.PhotoImage, int]]:
-        if state in self._cache:
-            return self._cache[state]
+        flip = bool(getattr(self, "facing_left", False)) and state in self.SIDE_STATES
+        key = f"{state}|flip" if flip else state
+        if key in self._cache:
+            return self._cache[key]
         out: list[tuple[ImageTk.PhotoImage, int]] = []
         for image, duration in self.library.states[state]:
             width, height = image.size
@@ -405,8 +417,10 @@ class Animator:
                 resized = image.convert("RGBa").resize(new_size, Image.LANCZOS).convert("RGBA")
             else:
                 resized = image.resize(new_size, Image.LANCZOS)
+            if flip:
+                resized = resized.transpose(Image.FLIP_LEFT_RIGHT)
             out.append((ImageTk.PhotoImage(resized), duration))
-        self._cache[state] = out
+        self._cache[key] = out
         return out
 
     def _tick(self) -> None:
@@ -627,6 +641,103 @@ class Particles:
             return
 
 
+# --------------------------------------------------------------------------- 表情包
+def sticker_photo(path: Path, max_side: int) -> ImageTk.PhotoImage | None:
+    try:
+        image = Image.open(path).convert("RGBA")
+    except Exception as exc:
+        log(f"表情包打不开：{path.name}（{exc}）")
+        return None
+    image.thumbnail((max_side, max_side), Image.LANCZOS)
+    return ImageTk.PhotoImage(image)
+
+
+def insert_sticker(text_widget: tk.Text, path: Path, keep: list, max_side: int = 120) -> None:
+    """把表情包当图片插进聊天记录（keep 用来保住 PhotoImage 引用，防止被回收变空白）。"""
+    photo = sticker_photo(path, max_side)
+    if photo is None:
+        return
+    keep.append(photo)
+    del keep[:-30]
+    text_widget.configure(state="normal")
+    text_widget.image_create("end", image=photo, padx=4, pady=2)
+    text_widget.insert("end", "\n\n")
+    text_widget.configure(state="disabled")
+    text_widget.see("end")
+
+
+class StickerPopup:
+    """桌宠旁边弹出的表情包小卡片：淡入、停几秒、淡出；点一下就收起。"""
+
+    MAX_SIDE = 170
+
+    def __init__(self, app: "PetApp"):
+        self.app = app
+        self.win: tk.Toplevel | None = None
+        self._photo = None
+        self._jobs: list = []
+
+    def show(self, path: Path, duration_ms: int = 4200) -> bool:
+        self.hide()
+        photo = sticker_photo(path, self.MAX_SIDE)
+        if photo is None:
+            return False
+        app = self.app
+        win = tk.Toplevel(app.root)
+        win.overrideredirect(True)
+        try:
+            win.attributes("-topmost", True)
+            win.attributes("-alpha", 0.0)
+        except Exception:
+            pass
+        frame = tk.Frame(win, bg="#ffffff", highlightbackground="#a9c3f2", highlightthickness=2)
+        frame.pack()
+        label = tk.Label(frame, image=photo, bg="#ffffff", cursor="hand2")
+        label.pack(padx=6, pady=6)
+        label.bind("<Button-1>", lambda _event: self.hide())
+        self.win, self._photo = win, photo
+        # 放在她身体左边（靠头的高度），左边放不下就放右边
+        w, h = photo.width() + 16, photo.height() + 16
+        body_left = app.root.winfo_x() + (app.W - app.pet_w) // 2
+        x = body_left - w + 12
+        if x < 0:
+            x = body_left + app.pet_w - 12
+        y = max(0, app.root.winfo_y() + app.H - app.pet_h - h // 3)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        self._fade(0.0, 0.12, then=lambda: self._jobs.append(
+            app.root.after(duration_ms, lambda: self._fade(1.0, -0.12, then=self.hide))))
+        return True
+
+    def _fade(self, alpha: float, step: float, then=None) -> None:
+        if self.win is None:
+            return
+        alpha = max(0.0, min(1.0, alpha + step))
+        try:
+            self.win.attributes("-alpha", alpha)
+        except Exception:
+            pass
+        if (step > 0 and alpha >= 1.0) or (step < 0 and alpha <= 0.0):
+            if then:
+                then()
+            return
+        self._jobs.append(self.app.root.after(30, self._fade, alpha, step, then))
+
+    def hide(self) -> None:
+        for job in self._jobs:
+            try:
+                self.app.root.after_cancel(job)
+            except Exception:
+                pass
+        self._jobs = []
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+        self.win = None
+        self._photo = None
+
+
 # --------------------------------------------------------------------------- 聊天窗
 class ChatWindow(tk.Toplevel):
     def __init__(self, app: "PetApp"):
@@ -695,6 +806,12 @@ class ChatWindow(tk.Toplevel):
         self.log.insert("end", text + "\n\n")
         self.log.configure(state="disabled")
         self.log.see("end")
+
+    def append_sticker(self, who: str, path: Path) -> None:
+        self.log.configure(state="normal")
+        self.log.insert("end", f"{who}：", "her")
+        self.log.configure(state="disabled")
+        insert_sticker(self.log, path, self.__dict__.setdefault("_sticker_refs", []), 140)
 
     def send(self, text: str | None = None) -> None:
         message = (text if text is not None else self.entry.get()).strip()
@@ -871,6 +988,15 @@ class QuickChat(tk.Toplevel):
             self.transcript.insert("end", (text + "\n\n"), bubble)
             self.transcript.configure(state="disabled")
             self.transcript.see("end")
+        except Exception:
+            pass
+
+    def append_sticker(self, who: str, path: Path) -> None:
+        try:
+            self.transcript.configure(state="normal")
+            self.transcript.insert("end", f"{who}\n", "her_name")
+            self.transcript.configure(state="disabled")
+            insert_sticker(self.transcript, path, self.__dict__.setdefault("_sticker_refs", []), 110)
         except Exception:
             pass
 
@@ -1233,6 +1359,7 @@ class PetApp:
         for food in FEED_LINES:
             feed_counts.setdefault(food, 0)
         self.config.setdefault("inner_voice_chance", 1 / 6)
+        self.config.setdefault("sticker_chance", 0.3)  # 聊天回复后顺手甩个表情包的概率
         dsh_status = self.config.setdefault("dsh_status", {})
         if not isinstance(dsh_status, dict):
             dsh_status = {}
@@ -1374,6 +1501,7 @@ class PetApp:
                                      overview=self.overview,
                                      status_path=self._status_path(), log=log,
                                      confirm=self._confirm_tool)
+            self.agent.memory = self.brain  # Agent 聊天也读记忆（之前只有人设，每次都像第一次见面）
         except Exception as exc:
             log(f"Agent 层未启用：{exc}")
 
@@ -1387,6 +1515,10 @@ class PetApp:
         self._speaking = False
         self._last_user_text = ""
         self.particles = Particles(self.canvas, self.W, self.H)
+        self.stickers = StickerBook(ASSETS / "stickers")
+        self.sticker_popup = StickerPopup(self)
+        self._eating = False
+        self._food_frames: list = []
         self._emotion = "idle"
         self._emotion_job = None
         self._speech_settle_job = None
@@ -1408,11 +1540,15 @@ class PetApp:
         self._place_window()
         self.root.bind("<Enter>", self._on_hover, add="+")
         self._bind_events()
+        # 住在桌面上：窗口当平台、自己过日子（生活状态存 life.json，她写的东西在 home/）
+        from living import Living
+        self.living = Living(self, BASE / "life.json", BASE / "home", log=log)
         self.menu = self._build_menu()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
         self.animator.play(self.library.best("idle"))
         self.root.after(700, self._startup)
+        self.living.start()
         self.root.after(1500, self._save_rect)
         self.root.after(1300, self._poll_dsh_status)
         self.root.after(8000, self._proactive_tick)
@@ -1578,7 +1714,29 @@ class PetApp:
         self.approval_prompt = None
         return bool(finished and result["ok"])
 
+    def live_context(self) -> str:
+        """「此刻」一行（≤70 字）：几点、她刚在干嘛、她的状态、主人在干嘛。让她像活在当下，而不是每次从零开始。"""
+        weekday = "一二三四五六日"[time.localtime().tm_wday]
+        parts = [f"周{weekday} {time.strftime('%H:%M')}"]
+        living = getattr(self, "living", None)
+        if living is not None:
+            doing = {"stroll": "在桌面上溜达", "climb_window": "爬到窗口顶上玩", "peek_edge": "躲在屏幕边偷看",
+                     "nap": "刚在打盹", "snack": "刚偷吃了零食", "dance": "刚在跳舞", "browse_file": "刚翻了主人的文件",
+                     "write_diary": "刚写完日记", "call_master": "刚在喊主人"}.get(living.activity)
+            if doing:
+                parts.append(f"你{doing}")
+            parts.append(f"你现在{living.state.summary()}")
+        try:
+            import desktop
+            label = desktop.guess_activity(desktop.foreground_title())
+            if label:
+                parts.append(f"主人好像在{label}")
+        except Exception:
+            pass
+        return "；".join(parts)[:70]
+
     def ask_agent(self, text: str, on_reply=None) -> None:
+        self.brain.live_context = self.live_context()
         if getattr(self, "agent", None) is None:
             self.ask(text, on_reply)
             return
@@ -1597,6 +1755,10 @@ class PetApp:
             log(f"Agent 执行失败：{exc}")
             result = {"source": "error", "error": str(exc), "reply": "", "steps": []}
         if result.get("source") == "agent" and result.get("reply"):
+            try:
+                self.brain.note_exchange(text, str(result.get("reply") or ""))  # Agent 聊天也进记忆
+            except Exception as exc:
+                log(f"记忆写入失败：{exc}")
             self.root.after(0, self._agent_done, result, on_reply)
             return
         log(f"Agent 回退普通聊天：{result.get('error')}")
@@ -1721,8 +1883,14 @@ class PetApp:
                     self._start_flight(vx, vy)
                     return
             self._save_position()
+            if self._living_on():
+                self.living.dropped()  # 放在半空会掉到下面的窗口或任务栏上
         else:
             self.pat()
+
+    def _living_on(self) -> bool:
+        living = getattr(self, "living", None)
+        return living is not None and living.enabled()
 
     def _work_area(self) -> tuple[int, int, int, int] | None:
         """桌宠当前所在那块屏幕的工作区（去掉任务栏），多显示器时不会被吸回主屏。"""
@@ -1753,6 +1921,11 @@ class PetApp:
         return None
 
     def _start_flight(self, vx: float, vy: float) -> None:
+        if self._living_on():  # 住在桌面模式：交给 living 的物理，能落在窗口顶上
+            self.living.toss(vx, vy)
+            self._set_emotion("surprised", duration_ms=1600)
+            self.bubble.show(random.choice(DRAG_LINES), 2600)
+            return
         area = self._work_area() or (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
         left, top, right, bottom = area
         self._flight = {"x": float(self.root.winfo_x()), "y": float(self.root.winfo_y()),
@@ -1823,9 +1996,10 @@ class PetApp:
         menu.add_command(label="📡  公众号状态", command=self.show_wechat_status)
         menu.add_command(label="💰  API 余额", command=self.check_balance)
         menu.add_command(label="🧠  看她的记忆", command=self.show_memory)
-        self.roam_var = tk.BooleanVar(value=bool(self.config.get("roam_enabled")))
-        menu.add_checkbutton(label="🌊  让她自己在桌面走走", variable=self.roam_var,
-                             command=self.toggle_roam)
+        self.roam_var = tk.BooleanVar(value=bool(self.living.cfg.get("enabled", True)))
+        menu.add_checkbutton(label="🏠  住在桌面上（自己生活）", variable=self.roam_var,
+                             command=self.toggle_living)
+        menu.add_command(label="📂  打开她的小窝", command=self.open_home)
         self.auto_approve_var = tk.BooleanVar(
             value=bool((self.config.get("agent") or {}).get("auto_approve")))
         menu.add_checkbutton(label="🔓  全权限托管（危险）", variable=self.auto_approve_var,
@@ -1841,6 +2015,9 @@ class PetApp:
                            ("diamond", "💎 钻石")):
             feed_menu.add_command(label=label, command=lambda food=key: self.feed(food))
         menu.add_cascade(label="🍽  投喂", menu=feed_menu)
+        menu.add_command(label="🖼  甩个表情包",
+                         command=lambda: self.send_sticker(self._emotion if self._emotion != "idle" else "happy",
+                                                           force=True))
         perform_menu = tk.Menu(menu, tearoff=0, font=("Microsoft YaHei", 9))
         for key, label in (("happy", "开心"), ("shy", "害羞"), ("angry", "生气"),
                            ("sad", "难过"), ("surprised", "惊讶"), ("confused", "困惑"),
@@ -2052,6 +2229,7 @@ class PetApp:
 
     def pat(self) -> None:
         self._touch()
+        self.living.event("pat")
         self._react(("摸摸", "摸头", "头", "贴贴", "抱抱"), (
             "唔……只能摸一下哦，摸多了本鲸的算力会不稳定……再摸一下也行。",
             "（鲸鳍耳像含羞草一样缩起来）才、才没有很舒服。",
@@ -2080,6 +2258,7 @@ class PetApp:
             food = "rice"
         counts = self.config.setdefault("feed_counts", {})
         counts[food] = int(counts.get(food, 0)) + 1
+        self.living.event(f"fed:{food}")
         if food == "rice":
             self._rice_count += 1
             self.config["rice_count"] = self._rice_count
@@ -2094,6 +2273,116 @@ class PetApp:
             self.voice.speak(text)
             self._cancel_speech_settle()
             self._set_emotion("hungry", duration_ms=3200)
+        self._start_eating(food)
+
+    # ---------- 吃东西：手里拿出食物 → 一口一口咬 → 吃完开心 ----------
+    def _start_eating(self, food: str) -> None:
+        if self._eating:  # 嘴里还有就先吃完这口，台词照说
+            return
+        self._eating = True
+        size = int(min(96, max(56, self.pet_w * 0.22)))
+        try:
+            self._food_frames = [ImageTk.PhotoImage(render_food(food, size, bites)) for bites in range(4)]
+        except Exception as exc:
+            log(f"食物道具画不出来：{exc}")
+            self._eating = False
+            return
+        # 举在身体右前方、大概手的高度；先从下面冒出来
+        x = self.W / 2 + self.pet_w * 0.18
+        y = self.H - self.pet_h * 0.42
+        item = self.canvas.create_image(x, y + 24, image=self._food_frames[0])
+        self.canvas.tag_raise(item)
+        self._food_keep_on_top(item)
+        for step in range(1, 7):
+            self.root.after(step * 30, lambda: self._food_move(item, 0, -4))
+        self.root.after(650, lambda: self.animator.play(self._state_for("eat")))
+        for bite, delay in enumerate((1000, 1600, 2200), start=1):
+            self.root.after(delay, self._food_bite, item, bite, x, y)
+        self.root.after(950, lambda: self.voice.speak(random.choice(CHOMP_SOUNDS)))  # 咀嚼声（静音时 speak 自己会跳过）
+        self.root.after(2850, self._finish_eating, item, food)
+
+    def _food_keep_on_top(self, item: int) -> None:
+        """动画每帧会把角色图层提到最上面，吃东西期间不停把食物再提上来，不然会被身体盖住。"""
+        if not self._eating:
+            return
+        try:
+            if not self.canvas.type(item):
+                return
+            self.canvas.tag_raise(item)
+        except Exception:
+            return
+        self.root.after(40, self._food_keep_on_top, item)
+
+    def _food_move(self, item: int, dx: float, dy: float) -> None:
+        try:
+            self.canvas.move(item, dx, dy)
+            self.canvas.tag_raise(item)
+        except Exception:
+            pass
+
+    def _food_bite(self, item: int, bite: int, x: float, y: float) -> None:
+        try:
+            self.canvas.itemconfigure(item, image=self._food_frames[min(bite, 3)])
+        except Exception:
+            return
+        for _ in range(4):  # 掉几粒碎屑
+            crumb = self.canvas.create_oval(0, 0, 4, 4, fill=random.choice(("#f3e3c3", "#e9c98f", "#ffffff")),
+                                            outline="")
+            self.canvas.move(crumb, x + random.randint(-14, 18), y + random.randint(-6, 10))
+            self._crumb_fall(crumb, random.uniform(-0.8, 0.8), 10)
+
+    def _crumb_fall(self, crumb: int, drift: float, ttl: int) -> None:
+        if ttl <= 0:
+            try:
+                self.canvas.delete(crumb)
+            except Exception:
+                pass
+            return
+        try:
+            self.canvas.move(crumb, drift, 3)
+            self.canvas.tag_raise(crumb)
+        except Exception:
+            return
+        self.root.after(40, self._crumb_fall, crumb, drift, ttl - 1)
+
+    def _finish_eating(self, item: int, food: str) -> None:
+        try:
+            self.canvas.delete(item)
+        except Exception:
+            pass
+        self._food_frames = []
+        self._eating = False
+        self._set_emotion("happy", duration_ms=2600)
+        if random.random() < 0.5:
+            self.send_sticker("eat", force=True)
+
+    # ---------- 表情包 ----------
+    def send_sticker(self, emotion: str = "", text: str = "", tags: tuple[str, ...] = (),
+                     force: bool = False) -> bool:
+        """按情绪/内容挑一张表情包：桌宠旁边弹卡片，聊天窗开着就也插一张。"""
+        if not len(self.stickers):
+            if force:
+                self.bubble.show("本鲸的表情包还没下载（tools/sync_stickers.py）", 3000)
+            return False
+        if not force:
+            try:
+                if random.random() >= float(self.config.get("sticker_chance", 0.3)):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        picked = self.stickers.pick(emotion, text, tags)
+        if picked is None:
+            return False
+        if not self.hidden:
+            self.sticker_popup.show(picked["path"])
+        for window in (self.chat_window, self.quick_chat):
+            try:
+                if window is not None and window.winfo_exists():
+                    window.append_sticker(self.display_name, picked["path"])
+            except Exception:
+                pass
+        log(f"表情包：{picked.get('alt', '')[:30]}")
+        return True
 
     # ---------- 微信公众号 ----------
     def start_wechat(self) -> None:
@@ -2226,15 +2515,25 @@ class PetApp:
             self.bubble.show(f"QQ 桥在跑：{bridge.base_url}（只聊天、不动电脑）", 3600)
 
     # ---------- 自主活动 / 全权限 / 记忆查看 ----------
-    def toggle_roam(self) -> None:
-        self.config["roam_enabled"] = bool(self.roam_var.get())
+    def toggle_living(self) -> None:
+        on = bool(self.roam_var.get())
+        self.living.cfg["enabled"] = on
         self.save_config()
-        self.bubble.show("好呀，本鲸自己在桌面上溜达溜达～" if self.config["roam_enabled"]
-                         else "那本鲸乖乖待着。", 2600)
+        if on:
+            self.living.dropped()
+        self.bubble.show("好呀，本鲸自己在桌面上过日子啦～" if on else "那本鲸乖乖待在这儿不动。", 2600)
+
+    def open_home(self) -> None:
+        home = BASE / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(home))
+        except Exception as exc:
+            self.bubble.show(f"小窝打不开：{exc}", 3000)
 
     def _roam_tick(self) -> None:
         try:
-            if (self.config.get("roam_enabled") and not self._busy and not self._drag
+            if (self.config.get("roam_enabled") and not self._living_on() and not self._busy and not self._drag
                     and not self._speaking and self._dsh_state in ("idle", "disconnected")
                     and time.time() - self._last_interaction > 45 and random.random() < 0.5):
                 screen_w = self.root.winfo_screenwidth()
@@ -2280,7 +2579,7 @@ class PetApp:
             cfg_enabled = bool(self.config.get("autonomy_enabled", True))
             quiet = (not self._busy and not self._speaking and self._emotion_job is None
                      and self._dsh_state in ("idle", "disconnected"))
-            if (cfg_enabled and quiet and time.time() - self._last_interaction > 120
+            if (cfg_enabled and quiet and not self._living_on() and time.time() - self._last_interaction > 120
                     and random.random() < 0.35):
                 action = random.choice(("wave", "happy", "dance", "sleepy", "walk", "jump"))
                 state = self._state_for(action)
@@ -2652,6 +2951,7 @@ class PetApp:
 
     # ---------- 大脑 ----------
     def ask(self, text: str, on_reply=None) -> None:
+        self.brain.live_context = self.live_context()
         self._busy = True
         self._touch()
         self._last_user_text = str(text or "")
@@ -2672,8 +2972,13 @@ class PetApp:
         self._cancel_speech_settle()
         self._cancel_emotion_job()
         emotion = self._emotion_for_reply(reply, source)
+        self.living.event("chat")
+        # 回复里写了（尾巴一甩）（捂脸）这类小动作，就真的做出来，而不是一律「说话」动画
+        acted = state_for_actions(reply) if source != "offline-error" else None
+        if acted:
+            emotion = acted if acted in PARTICLE_SPECS else emotion
         self._emotion = emotion
-        self.animator.play(self._state_for("sad" if source == "offline-error" else "talking"))
+        self.animator.play(self._state_for("sad" if source == "offline-error" else (acted or "talking")))
         inner_voice = None
         chance = self.config.get("inner_voice_chance", 1 / 6)
         try:
@@ -2684,12 +2989,14 @@ class PetApp:
         self.bubble.show(reply, inner_voice=inner_voice)
         self.particles.burst(emotion, count=4)
         self.voice.speak(reply, interrupt=True)
-        self._schedule_speech_settle(1600)
+        self._schedule_speech_settle(2400 if acted else 1600)
         if on_reply is not None:
             try:
                 on_reply(reply, source)
             except Exception as exc:
                 log(f"回调失败：{exc}")
+        if source != "offline-error":  # 聊天窗先显示文字，再甩图
+            self.root.after(600, lambda: self.send_sticker(emotion, reply))
 
     def toggle_autonomy(self) -> None:
         enabled = bool(self.autonomy_var.get())
@@ -2753,6 +3060,10 @@ class PetApp:
             self.root.after(1200, self.open_chat)
 
     def quit(self) -> None:
+        try:
+            self.living.save()
+        except Exception:
+            pass
         try:
             if getattr(self, "wechat_server", None) is not None:
                 self.wechat_server.stop()

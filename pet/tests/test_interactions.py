@@ -4,8 +4,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from interactions import (DRAG_LINES, FOOD_EMOJI, FEED_LINES, INNER_VOICE_LINES, render_food,
-                          step_flight, visible_ratio)
+from interactions import (DRAG_LINES, FOOD_EMOJI, FEED_LINES, INNER_VOICE_LINES, actions_in,
+                          render_food, state_for_actions, step_flight, visible_ratio)
 
 
 class InteractionHelpersTest(unittest.TestCase):
@@ -56,6 +56,15 @@ class InteractionHelpersTest(unittest.TestCase):
             bitten = visible_ratio(render_food(food, 64, bites=3))
             self.assertGreater(whole, 0.15, food)
             self.assertLess(bitten, whole * 0.9, food)
+
+    def test_actions_in_reply_become_states(self):
+        self.assertEqual(actions_in("（尾巴一甩）好呀 *捂脸*"), ["尾巴一甩", "捂脸"])
+        self.assertEqual(state_for_actions("（尾巴一甩）好呀"), "happy")
+        self.assertEqual(state_for_actions("哼(叉腰)才不要"), "angry")
+        self.assertEqual(state_for_actions("*歪头* 这是啥"), "confused")
+        self.assertEqual(state_for_actions("（扒两口饭）香"), "eat")
+        self.assertIsNone(state_for_actions("没有动作的一句话"))
+        self.assertIsNone(state_for_actions("（某某大学）"))  # 认不出来的括号不乱做动作
 
 
 if __name__ == "__main__":

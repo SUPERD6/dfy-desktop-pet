@@ -92,3 +92,39 @@ def visible_ratio(image) -> float:
     """不透明像素占比：测试用来确认咬一口确实变少了。"""
     alpha = image.getchannel("A")
     return sum(1 for value in alpha.getdata() if value > 16) / float(image.width * image.height)
+
+
+# ---------- 回复里的小动作 → 真的做出来 ----------
+import re as _re
+
+_ACTION_TEXT_RE = _re.compile(r"（([^（）\n]{1,20})）|\(([^()\n]{1,20})\)|\*([^*\n]{1,20})\*")
+# 关键词 → 桌宠状态；越靠前越优先（同一句里先命中的赢）
+ACTION_STATES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("吃", "啃", "饭", "咬", "嚼", "吞", "饼干"), "eat"),
+    (("跳舞", "转圈", "扭"), "dance"),
+    (("蹦", "跳"), "jump"),
+    (("挥手", "招手", "打招呼"), "wave"),
+    (("脸红", "害羞", "捂脸", "扭捏", "低头"), "shy"),
+    (("哼", "叉腰", "鼓腮", "瞪", "炸毛", "生气"), "angry"),
+    (("哭", "委屈", "耷拉", "瘪嘴", "抽泣"), "sad"),
+    (("惊", "瞪大", "愣"), "surprised"),
+    (("歪头", "挠头", "疑惑", "眨眼"), "confused"),
+    (("哈欠", "困", "揉眼", "趴", "打盹"), "sleepy"),
+    (("得意", "挺胸", "叉腰笑", "推眼镜"), "proud"),
+    (("偷看", "探头", "躲", "溜"), "sneak"),
+    (("尾巴", "摇", "蹭", "笑", "开心"), "happy"),
+)
+
+
+def actions_in(text: str) -> list[str]:
+    """取出回复里括号/星号包着的动作描写。"""
+    return [next(g for g in m.groups() if g) for m in _ACTION_TEXT_RE.finditer(text or "")]
+
+
+def state_for_actions(text: str) -> str | None:
+    """回复里第一个能认出来的动作对应的状态；没有动作描写返回 None。"""
+    for action in actions_in(text):
+        for keywords, state in ACTION_STATES:
+            if any(k in action for k in keywords):
+                return state
+    return None

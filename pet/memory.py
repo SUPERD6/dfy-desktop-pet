@@ -39,6 +39,10 @@ FACTS_LIMIT = 120           # 长期事实最多保留多少条（超了淘汰�
 PROACTIVE_LIMIT = 20        # 主动搭话去重窗口
 RECENT_HISTORY = 8          # system prompt 注入的最近对话条数
 RELEVANT_LIMIT = 5          # system prompt 注入的最相关记忆条数
+CONSOLIDATE_AT = 40         # 对话攒到这么多条，就把最旧的一批压成日记（早于 HISTORY_LIMIT，旧话不会被直接丢）
+CONSOLIDATE_BATCH = 20      # 每次压缩多少条
+EPISODES_LIMIT = 200        # 日记最多留多少条，超了把最旧的几条并成一条
+EPISODE_MERGE = 8
 
 # 常见的单字虚词：参与打分容易误命中，单字 token 直接忽略（2-gram 仍保留一部分）
 _STOP_CHARS = set("我你他她它的了是在有就都也还和与跟对把被这那一个不没很太要会能吗呢吧啊哦呀嘛么什怎为何如")
@@ -104,6 +108,27 @@ def relevance_score(query_tokens: set[str], item_tokens: set[str]) -> float:
     return score / (len(item_tokens) ** 0.5)
 
 
+def similarity(a: set[str], b: set[str]) -> float:
+    """「是不是同一件事换了个说法」：短的那句的双字词，有多少落在长的那句里（覆盖率）。
+
+    不用 Jaccard：「主人喜欢猫 / 主人喜欢狗」的 Jaccard 有 0.6，会被误合并；覆盖率只有 0.75。
+    「喜欢喝冰美式 / 喜欢喝冰美式咖啡」覆盖率 1.0，才算同一件事。
+    """
+    a2 = {t for t in a if len(t) > 1}
+    b2 = {t for t in b if len(t) > 1}
+    if not a2 or not b2:
+        return 0.0
+    return len(a2 & b2) / min(len(a2), len(b2))
+
+
+def fact_keep_score(fact: dict, now: float) -> float:
+    """淘汰时的保留分：重要度权重最大，其次常被用到，再其次新近（半衰期约 30 天）。"""
+    importance = _as_float(fact.get("importance"), 1)
+    hits = _as_float(fact.get("hits"), 0)
+    age_days = max(0.0, (now - _as_float(fact.get("time"), now)) / 86400.0)
+    return importance * 2.0 + min(hits, 20) ** 0.5 + 2.0 * 0.5 ** (age_days / 30.0)
+
+
 def _as_float(value, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -167,10 +192,11 @@ class MemoryStore:
     def _migrate(self, raw: dict) -> dict:
         """旧格式 → v2；任何字段读不出来都用默认值自愈，绝不抛出。"""
         data: dict = {
-            "version": 2,
+            "version": 3,
             "user_name": "",
             "facts": [],
             "history": [],
+            "episodes": [],
             "proactive_recent": [],
             "stats": {},
         }
@@ -203,13 +229,30 @@ class MemoryStore:
             if key in seen:
                 continue
             seen.add(key)
-            facts.append({
+            fact = {
                 "kind": kind if kind in _KIND_LABEL else "note",
                 "text": text[:80],
                 "time": ts,
                 "ts": format_time(ts) if ts else "",
-            })
+            }
+            if isinstance(item, dict):  # v3 字段：命中次数、重要度（旧数据没有就用默认）
+                fact["hits"] = int(_as_float(item.get("hits"), 0))
+                fact["importance"] = int(min(3, max(1, _as_float(item.get("importance"), 1))))
+            facts.append(fact)
         data["facts"] = facts[-FACTS_LIMIT:]
+
+        # 情节记忆（日记）：旧对话压缩出来的，一条一句话
+        episodes: list[dict] = []
+        raw_episodes = raw.get("episodes")
+        for item in raw_episodes if isinstance(raw_episodes, list) else []:
+            if isinstance(item, dict) and str(item.get("text") or "").strip():
+                episodes.append({
+                    "text": str(item["text"]).strip()[:200],
+                    "time": _as_float(item.get("time"), 0.0),
+                    "start": _as_float(item.get("start"), 0.0),
+                    "end": _as_float(item.get("end"), 0.0),
+                })
+        data["episodes"] = episodes
 
         # 历史：只认 user/assistant 的文本内容，其它角色/坏行直接跳过
         history: list[dict] = []
@@ -295,21 +338,90 @@ class MemoryStore:
         return value if isinstance(value, list) else []
 
     # ---------- 写入 ----------
-    def add_fact(self, text: str, kind: str = "note", when: float | None = None) -> bool:
-        """添加一条事实；文本重复（忽略大小写/句末标点）时不重复添加。"""
+    def add_fact(self, text: str, kind: str = "note", when: float | None = None, importance: int = 1) -> bool:
+        """添加一条事实。
+
+        完全重复 → 不加；和已有事实是同一件事（短句双字词覆盖率 ≥ 0.85）→ 用新说法更新那条（时间刷新、重要度取大），
+        返回 False；满了按「重要度 + 命中次数 + 新近」综合分淘汰最不重要的，而不是最旧的。
+        """
         text = normalize_text(text)[:80]
         if not text:
             return False
         kind = kind if kind in _KIND_LABEL else "note"
+        importance = int(min(3, max(1, importance)))
         ts = _now(when)
         with self._lock:
-            existing = {normalize_text(item.get("text", "")).lower() for item in self.facts}
-            if text.lower() in existing:
-                return False
-            self.facts.append({"kind": kind, "text": text, "time": ts, "ts": format_time(ts)})
-            del self.facts[:-FACTS_LIMIT]
+            new_tokens = tokenize(text)
+            for item in self.facts:
+                old = normalize_text(item.get("text", ""))
+                if old.lower() == text.lower():
+                    item["importance"] = max(int(item.get("importance", 1)), importance)
+                    return False
+                if similarity(new_tokens, tokenize(old)) >= 0.85:
+                    item.update(text=text, kind=kind, time=ts, ts=format_time(ts),
+                                importance=max(int(item.get("importance", 1)), importance))
+                    self.dirty = True
+                    return False
+            self.facts.append({"kind": kind, "text": text, "time": ts, "ts": format_time(ts),
+                               "hits": 0, "importance": importance})
+            if len(self.facts) > FACTS_LIMIT:
+                now = _now()
+                self.facts.sort(key=lambda f: fact_keep_score(f, now))
+                del self.facts[: len(self.facts) - FACTS_LIMIT]
+                self.facts.sort(key=lambda f: _as_float(f.get("time"), 0.0))
             self.dirty = True
             return True
+
+    def mark_used(self, texts) -> None:
+        """这些事实被放进了 prompt：命中次数 +1（常被用到的记得更牢）。"""
+        wanted = {normalize_text(t).lower() for t in texts}
+        with self._lock:
+            for item in self.facts:
+                if normalize_text(item.get("text", "")).lower() in wanted:
+                    item["hits"] = int(item.get("hits", 0)) + 1
+                    self.dirty = True
+
+    # ---------- 情节记忆：旧对话压成日记 ----------
+    @property
+    def episodes(self) -> list[dict]:
+        return self.data.setdefault("episodes", [])
+
+    def needs_consolidation(self) -> bool:
+        return len(self.history) >= CONSOLIDATE_AT
+
+    def pop_oldest(self, count: int = CONSOLIDATE_BATCH) -> list[dict]:
+        """取走最旧的 count 条对话（交给压缩）；调用方必须随后 add_episode，不然就丢了。"""
+        with self._lock:
+            taken = self.history[:count]
+            del self.history[:count]
+            if taken:
+                self.dirty = True
+            return taken
+
+    def add_episode(self, text: str, start: float = 0.0, end: float = 0.0) -> None:
+        text = re.sub(r"\s+", " ", str(text or "")).strip()[:200]
+        if not text:
+            return
+        with self._lock:
+            self.episodes.append({"text": text, "time": _now(), "start": float(start), "end": float(end)})
+            while len(self.episodes) > EPISODES_LIMIT:  # 太多了：最旧的 8 条并成一条「很久以前」
+                old = self.episodes[:EPISODE_MERGE]
+                merged = "；".join(e["text"][:30] for e in old)[:200]
+                first = old[0].get("start") or old[0].get("time") or 0.0
+                last = old[-1].get("end") or old[-1].get("time") or 0.0
+                del self.episodes[:EPISODE_MERGE]
+                self.episodes.insert(0, {"text": f"（很久以前）{merged}", "time": _now(),
+                                         "start": first, "end": last})
+            self.dirty = True
+
+    def relevant_episodes(self, query: str, limit: int = 2) -> list[dict]:
+        tokens = tokenize(query)
+        if not tokens:
+            return []
+        scored = [(relevance_score(tokens, tokenize(e.get("text", ""))), e) for e in self.episodes]
+        scored = [row for row in scored if row[0] > 0]
+        scored.sort(key=lambda row: (row[0], _as_float(row[1].get("time"))), reverse=True)
+        return [e for _, e in scored[:limit]]
 
     def add_turn(self, role: str, content: str, when: float | None = None) -> None:
         """追加一条对话历史（只保留最近 HISTORY_LIMIT 条）。"""

@@ -382,6 +382,8 @@ class AgentRunner:
         self.allowed_roots = self._resolve_allowed_roots()
         self.status_path = self._resolve_status_path(status_path)
         self._active_key = ""
+        # 记忆来源（app 里接 Brain）：提供 memory_block(text, include_personal=False)，拼在 system prompt 末尾
+        self.memory = None
 
     # ------------------------------------------------------------------ 对外：主循环
     def run(self, user_text: str, on_step=None) -> dict:
@@ -533,6 +535,15 @@ class AgentRunner:
         if personal_block:
             lines += ["", "【主人的个人库摘要（只用来理解背景，不要逐字复述，不确定就不要编造）】",
                       personal_block]
+        block_fn = getattr(self.memory, "memory_block", None)
+        if callable(block_fn):  # 记忆放最后：前面不变的部分能吃到前缀缓存
+            try:
+                block = str(block_fn(user_text, include_personal=False) or "").strip()
+            except Exception as exc:
+                self.log("记忆读取失败：" + self._redact(str(exc))[:160])
+                block = ""
+            if block:
+                lines += ["", block]
         return "\n".join(lines)
 
     def _read_persona(self) -> str:

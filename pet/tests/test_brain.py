@@ -237,7 +237,7 @@ class LLMClientTests(BrainTestCase):
 
         # 记忆落盘：历史和 v2 结构都在
         data = self.read_memory_file()
-        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["version"], 3)
         self.assertEqual(data["history"][-2]["role"], "user")
         self.assertEqual(data["history"][-2]["content"], "你好呀")
         self.assertEqual(data["history"][-1]["role"], "assistant")
@@ -392,13 +392,18 @@ class MemoryTests(BrainTestCase):
         b2.reply("我叫什么名字？")
         self.assertEqual(b2.user_name(), "小明")
 
-    def test_history_limit_60(self) -> None:
-        """对话历史只保留最近 60 条。"""
+    def test_old_history_becomes_diary_not_lost(self) -> None:
+        """对话攒到 40 条就把最旧的 20 条压成日记；历史 + 压掉的 = 全部，一条不白丢。"""
         b = self.make_brain(enabled=False)
         for index in range(35):
             b.reply(f"随便聊第 {index} 句")
-        self.assertEqual(len(b.memory_store.history), 60)
-        self.assertEqual(len(self.read_memory_file()["history"]), 60)
+        history = len(b.memory_store.history)
+        episodes = b.memory_store.episodes
+        self.assertLess(history, 40)
+        self.assertGreaterEqual(len(episodes), 1)
+        self.assertEqual(history + 20 * len(episodes), 70)
+        self.assertIn("随便聊第 0 句", episodes[0]["text"])  # 离线摘抄兜底保住了最早的话
+        self.assertEqual(len(self.read_memory_file()["episodes"]), len(episodes))
         self.assertEqual(b.memory_store.history[-2]["content"], "随便聊第 34 句")
 
     def test_old_memory_json_self_heals(self) -> None:
@@ -418,7 +423,7 @@ class MemoryTests(BrainTestCase):
         self.assertIn("1 条对话", b.memory_summary())
 
         upgraded = self.read_memory_file()
-        self.assertEqual(upgraded["version"], 2)
+        self.assertEqual(upgraded["version"], 3)
         self.assertEqual([fact["text"] for fact in upgraded["facts"]], ["喜欢白饭", "讨厌香菜"])
 
         # 再读一次也不炸
@@ -433,7 +438,7 @@ class MemoryTests(BrainTestCase):
         self.assertTrue((self.dir / "memory.json.corrupt").exists())
         # 还能正常聊天并重新生成合法文件
         self.assertEqual(b.reply("你好")[1], "offline")
-        self.assertEqual(self.read_memory_file()["version"], 2)
+        self.assertEqual(self.read_memory_file()["version"], 3)
 
     def test_app_style_direct_memory_access(self) -> None:
         """兼容 app.py 设置窗直接写 brain.memory["user_name"] 的旧习惯。"""
@@ -485,11 +490,12 @@ class OfflineAndPromptTests(BrainTestCase):
         self.assertIn("小明", prompt)
         self.assertIn("喜欢蓝色", prompt)
         self.assertIn("最近的对话", prompt)
-        self.assertIn("20～60", prompt)
+        self.assertIn("回答要求", prompt)
+        self.assertLess(prompt.index("回答要求"), prompt.index("最近的对话"))  # 不变的在前、会变的在后
         self.assertNotIn(FAKE_KEY, prompt)
 
         no_query = b.system_prompt()
-        self.assertIn("你记得的事", no_query)
+        self.assertIn("你记得的", no_query)
 
     def test_status_text_variants(self) -> None:
         offline = self.make_brain(enabled=False)

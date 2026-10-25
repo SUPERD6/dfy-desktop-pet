@@ -85,7 +85,10 @@ def main() -> int:
                                                   ("rice", "fish", "cake", "tangyuan", "diamond")])),
         (6500, lambda: guard("inner voice bubble", lambda: application.bubble.show(
             "冒烟测试：心声", 800, inner_voice="这用户发的啥啊，"))),
+        (6550, lambda: guard("reply with action", lambda: application._show_reply("（尾巴一甩）好呀", "llm", None))),
+        (6580, lambda: guard("sticker", lambda: application.send_sticker("happy", force=True))),
         (6600, lambda: guard("toss", lambda: application._start_flight(1400, -900))),
+        (9900, lambda: guard("eating finished", lambda: _assert(not application._eating, "吃完没复位"))),
         (10100, lambda: guard("toss landed", lambda: _assert(application._flight is None, "抛出后没落地"))),
         (10300, lambda: (application.voice.shutdown(), application.root.destroy())),
     ]

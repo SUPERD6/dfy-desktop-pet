@@ -29,9 +29,9 @@ import urllib.request
 from pathlib import Path
 
 try:  # 常规用法：桌宠把 pet/ 放进 sys.path 后直接 import brain
-    from memory import MemoryStore
+    from memory import CONSOLIDATE_BATCH, MemoryStore, format_time
 except ImportError:  # 兜底：把 pet/ 当包导入时
-    from .memory import MemoryStore
+    from .memory import CONSOLIDATE_BATCH, MemoryStore, format_time
 
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
@@ -480,6 +480,32 @@ class Brain:
         self._save_memory()
         return line
 
+    def remark(self, task: str, material: str = "", max_tokens: int = 90) -> str | None:
+        """桌面生活用的一次性小调用（翻文件嘀咕一句、写日记）。
+
+        只带人设（与聊天同前缀，能吃到前缀缓存）+ 任务 + 截断的素材，不带对话历史；
+        没模型或失败返回 None，调用方用离线台词兜底。
+        """
+        if not self._llm_ready():
+            return None
+        try:
+            key, _source = self._resolve_api_key()
+            options = dict(self._llm_options())
+            options["max_tokens"] = int(max_tokens)
+            messages = [
+                {"role": "system", "content": self._persona_prompt()},
+                {"role": "user", "content": f"{task}\n\n【素材】\n{str(material or '')[:1500]}"},
+            ]
+            raw = self._request_chat_with_retries(messages, options, key)
+            if max_tokens > 120:  # 日记这类长一点的，多行合成一段，别只留第一行
+                raw = " ".join(line.strip() for line in str(raw or "").splitlines() if line.strip())
+            text = self._clean_line(raw)
+        except Exception as exc:
+            detail = exc.detail if isinstance(exc, LLMError) else self._redact(str(exc))
+            self.log(f"小调用失败，用离线台词：{detail}")
+            return None
+        return text or None
+
     def line_for_dsh_state(self, state: str) -> str | None:
         """DSH 工作状态反应台词；不认识的状态返回 None（idle 不打扰）。"""
         key = str(state or "").strip().lower()
@@ -499,42 +525,75 @@ class Brain:
             return DEFAULT_PERSONA
 
     def system_prompt(self, query: str = "") -> str:
-        """拼 system prompt：人设 + 称呼 + 最近 8 条对话 + 最相关 5 条记忆。"""
+        """拼 system prompt。
+
+        顺序为省 token 设计：不变的放前（人设、PARTNER、相处笔记、回答要求），
+        DeepSeek 等接口对相同前缀自动缓存（命中价约 1/10）；每轮变化的放后（memory_block）。
+        """
         lines = [self.persona, ""]
-        lines.append(f"用户的称呼：{self.user_name()}。")
-        recent = self.memory_store.recent_dialogue(8)
-        if recent:
-            lines.append("你们最近的对话（从旧到新）：")
-            lines.extend("- " + item for item in recent)
-        relevant = self.memory_store.relevant_lines(query, 5) if str(query or "").strip() else []
-        if relevant:
-            lines.append("和这次话题相关、你记得的事：")
-            lines.extend("- " + item for item in relevant)
-        elif self.memory_store.facts:
-            remembered = "；".join(fact.get("text", "") for fact in self.memory_store.facts[-5:])
-            lines.append(f"你记得的事：{remembered}。")
-        else:
-            lines.append("你还没有关于用户的记忆，可以自然地问问对方。")
-        if getattr(self, "personal", None) is not None:
-            try:
-                block = self.personal.prompt_block(query)
-            except Exception as exc:
-                self.log(f"个人库摘要失败：{exc}")
-                block = ""
-            if block:
-                lines.append(block)
-        if getattr(self, "extra_context", ""):
-            lines.append("【最近工作总览（回答“我最近在做什么/还有什么要做”时参考，别逐条复述）】")
-            lines.append(self.extra_context)
-        if getattr(self, "learned_notes", ""):
-            lines.append("【你们的相处笔记（你自己之前总结的，只作参考，不确定就别说）】")
-            lines.append(self.learned_notes[-900:])
         if getattr(self, "partner_text", ""):
             lines.append("【PARTNER.md：用户写的/维护的「你对他的了解」档案，优先参考】")
             lines.append(self.partner_text[-1200:])
-        lines.append("回答要求：中文口语，20～60 字，最多两小句；不写列表和 Markdown；"
-                     "不解释自己是 AI；不确定就说不确定。")
-        return "\n".join(lines)
+        if getattr(self, "learned_notes", ""):
+            lines.append("【你们的相处笔记（你自己之前总结的，只作参考，不确定就别说）】")
+            lines.append(self.learned_notes[-900:])
+        lines.append("回答要求：中文口语，一般一两句，长短随话题；不写列表和 Markdown；不确定就说不确定。")
+        lines.append("")
+        lines.append(self.memory_block(query, include_personal=True))
+        return "\n".join(line for line in lines if line is not None)
+
+    def memory_block(self, query: str = "", include_personal: bool = True) -> str:
+        """每轮会变的部分：此刻、相关事实、相关日记、最近对话（Agent 的 system prompt 也拼这一块）。
+
+        总长受 config.memory.prompt_budget_chars（默认 1800）约束，超了按优先级从低往高丢：
+        工作总览 → 个人库 → 日记 → 事实 → 最近对话（最近对话最重要，最后才裁）。
+        """
+        store = self.memory_store
+        blocks: list[tuple[int, str]] = []  # (优先级，越大越重要, 文本)
+        live = str(getattr(self, "live_context", "") or "").strip()
+        head = f"用户的称呼：{self.user_name()}。"
+        if live:
+            head += f"\n【此刻】{live}"
+        blocks.append((9, head))
+        query = str(query or "").strip()
+        facts = store.relevant(query, 5) if query else []
+        fact_lines = [item["detail"] for item in facts if item["type"] == "fact"]
+        history_lines = [item["detail"] for item in facts if item["type"] == "history"]
+        if not fact_lines and store.facts:
+            ranked = sorted(store.facts, key=lambda f: (int(f.get("importance", 1)), f.get("time", 0)), reverse=True)
+            fact_lines = [f"[记得] {f.get('text', '')}" for f in ranked[:4]]
+        if fact_lines:
+            store.mark_used([line.split("] ", 1)[-1] for line in fact_lines])
+            blocks.append((7, "你记得的关于主人的事：\n" + "\n".join("- " + line for line in fact_lines + history_lines)))
+        elif not store.history:
+            blocks.append((7, "你还没有关于主人的记忆，可以自然地问问。"))
+        episodes = store.relevant_episodes(query, 2) if query else []
+        if store.episodes and store.episodes[-1] not in episodes:
+            episodes.append(store.episodes[-1])
+        if episodes:
+            blocks.append((5, "以前的事（你的日记）：\n" + "\n".join(
+                f"- {format_time(e.get('end') or e.get('time'))} {e.get('text', '')}" for e in episodes)))
+        recent = [line[:80] for line in store.recent_dialogue(6)]
+        if recent:
+            blocks.append((8, "你们最近的对话（从旧到新）：\n" + "\n".join("- " + line for line in recent)))
+        if include_personal and getattr(self, "personal", None) is not None:
+            try:
+                personal = self.personal.prompt_block(query)
+            except Exception as exc:
+                self.log(f"个人库摘要失败：{exc}")
+                personal = ""
+            if personal:
+                blocks.append((3, personal))
+        if getattr(self, "extra_context", ""):
+            blocks.append((2, "【最近工作总览（问到「我最近在做什么」时参考，别逐条复述）】\n" + self.extra_context))
+        try:
+            budget = int((self.config.get("memory") or {}).get("prompt_budget_chars") or 1800)
+        except (TypeError, ValueError):
+            budget = 1800
+        order = list(range(len(blocks)))
+        while sum(len(blocks[i][1]) for i in order) > budget and len(order) > 1:
+            order.remove(min(order, key=lambda i: blocks[i][0]))  # 丢最不重要的一块
+        return "\n".join(blocks[i][1] for i in order)
 
     def _persona_prompt(self) -> str:
         """主动搭话等场景用：人设 + 称呼 + 少量最新事实（不塞整段历史）。"""
@@ -593,6 +652,79 @@ class Brain:
     def _remember(self, user_text: str, answer: str) -> None:
         self.memory_store.remember_exchange(user_text, answer)
         self._save_memory()
+        if self.memory_store.needs_consolidation() and not getattr(self, "_consolidating", False):
+            self._consolidating = True
+            if not self._llm_ready():  # 离线只做摘抄，很快，直接同步做
+                self._consolidate_bg()
+                return
+            import threading
+            threading.Thread(target=self._consolidate_bg, daemon=True).start()
+
+    def note_exchange(self, user_text: str, answer: str) -> None:
+        """Agent 路径聊完一轮也要记：学事实 + 入历史 + 触发压缩（之前 Agent 聊天不进记忆）。"""
+        user_text = str(user_text or "").strip()
+        if not user_text:
+            return
+        self._learn(user_text)
+        self._remember(user_text, str(answer or ""))
+
+    def _consolidate_bg(self) -> None:
+        try:
+            self.consolidate()
+        except Exception as exc:
+            self.log(f"记忆压缩失败：{self._redact(str(exc))}")
+        finally:
+            self._consolidating = False
+
+    def consolidate(self) -> str:
+        """把最旧的一批对话压成一条日记 + 最多 3 条长期事实。返回写下的日记文本。
+
+        一次小调用（max_tokens 220、低温度）；没模型/失败/输出坏掉就用摘抄兜底，旧对话绝不白丢。
+        """
+        turns = self.memory_store.pop_oldest(CONSOLIDATE_BATCH)
+        if not turns:
+            return ""
+        start = float(turns[0].get("time") or 0.0)
+        end = float(turns[-1].get("time") or 0.0)
+        transcript = "\n".join(f"{'主人' if t['role'] == 'user' else '我'}：{t['content'][:120]}" for t in turns)
+        diary, facts = "", []
+        if self._llm_ready():
+            try:
+                key, _source = self._resolve_api_key()
+                options = dict(self._llm_options())
+                options.update(max_tokens=220, temperature=0.3)
+                messages = [
+                    {"role": "system", "content": "你在帮一个桌宠整理她和主人的聊天记忆。只输出 JSON，不要别的字。"},
+                    {"role": "user", "content": (
+                        "把下面这段对话压成：\n"
+                        '{"diary": "以「我」的口吻写的一句日记，≤60 字，记发生了什么和主人的情绪", '
+                        '"facts": [{"kind": "like|dislike|event|note", "text": "关于主人、值得长期记住的事，≤30 字", '
+                        '"importance": 1到3}]}\n'
+                        "facts 最多 3 条，没有就空数组；别记寒暄。\n\n" + transcript)},
+                ]
+                raw = self._request_chat_with_retries(messages, options, key)
+                match = re.search(r"\{.*\}", str(raw or ""), re.S)
+                data = json.loads(match.group(0)) if match else {}
+                diary = str(data.get("diary") or "").strip()
+                facts = [f for f in (data.get("facts") or []) if isinstance(f, dict)][:3]
+            except Exception as exc:
+                detail = exc.detail if isinstance(exc, LLMError) else self._redact(str(exc))
+                self.log(f"记忆压缩用模型失败，改用摘抄：{detail}")
+                diary, facts = "", []
+        if not diary:  # 摘抄兜底：主人说过的前几句
+            said = [t["content"][:24] for t in turns if t["role"] == "user"][:4]
+            diary = "和主人聊了：" + "；".join(said) if said else "和主人闲聊了一会儿。"
+        self.memory_store.add_episode(diary, start, end)
+        for fact in facts:
+            try:
+                importance = int(fact.get("importance") or 2)
+            except (TypeError, ValueError):
+                importance = 2
+            self.memory_store.add_fact(str(fact.get("text") or ""), str(fact.get("kind") or "note"),
+                                       importance=importance)
+        self._save_memory()
+        self.log(f"记忆压缩：{len(turns)} 条对话 → 日记「{diary[:30]}」，事实 {len(facts)} 条")
+        return diary
 
     def _save_memory(self) -> None:
         # MemoryStore.save 内部已捕获异常并 log，不会抛
