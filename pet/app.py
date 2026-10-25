@@ -27,15 +27,21 @@ from tkinter import font as tkfont
 from PIL import Image, ImageDraw, ImageTk
 from interactions import (DRAG_LINES, FEED_LINES, INNER_VOICE_LINES, render_food,
                           state_for_actions, step_flight)
+from memory import format_time
 from stickers import StickerBook
 
 CHOMP_SOUNDS = ("啊呜～咔嚓咔嚓。", "嗷呜，吧唧吧唧……", "咔嚓咔嚓，好吃！")
+# 心情标记里的情绪 → 动画状态
+MOOD_STATES = {"开心": "happy", "害羞": "shy", "得意": "proud", "想念": "shy",
+               "委屈": "sad", "难过": "sad", "担心": "confused"}
 
 BASE = Path(__file__).resolve().parent
 ASSETS = BASE / "assets"
 CACHE = BASE / "cache"
 LOG_DIR = BASE / "logs"
 CONFIG_PATH = BASE / "config.json"
+# 她的个人生活数据（饭量账本、生活状态、小窝）放哪；冒烟测试指到临时目录，别写坏真数据
+DATA_DIR = Path(os.environ.get("DFY_DATA_DIR") or BASE)
 KEY_COLOR = "#0b0e14"          # 透明色键
 DFY_TARGET_WIDTH = 430          # dsh-dfy 高清立绘（640² 预渲染）的显示宽度
 LEGACY_TARGET_WIDTH = 200       # 旧版 192×208 帧动画的显示宽度
@@ -508,6 +514,7 @@ class Bubble:
     def show(self, text: str, duration_ms: int | None = None, inner_voice: str | None = None) -> None:
         self.hide()
         text = (text or "").strip()
+        self.current_text = text  # 3D 身体从 /v1/pet/state 读这一句
         if not text:
             return
         if len(text) > 90:
@@ -549,6 +556,7 @@ class Bubble:
         self._hide_id = self.canvas.after(duration_ms, self.hide)
 
     def hide(self) -> None:
+        self.current_text = ""
         if self._hide_id is not None:
             try:
                 self.canvas.after_cancel(self._hide_id)
@@ -1328,6 +1336,147 @@ class SettingsWindow(tk.Toplevel):
         self.destroy()
 
 
+# --------------------------------------------------------------------------- 记忆窗口
+class MemoryWindow(tk.Toplevel):
+    """看她记得什么：事实（可删/调重要度）、日记、心情、最近一次召回、饭量、提醒。"""
+
+    def __init__(self, app: "PetApp"):
+        super().__init__(app.root)
+        from tkinter import ttk
+        self.app = app
+        self.title(f"{app.display_name}的记忆")
+        self.geometry("760x520")
+        self.configure(bg="#eef3ff")
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        self._facts_tab(notebook, ttk)
+        for title, builder in (("日记", self._diary_text), ("心情", self._mood_text),
+                               ("最近一次召回", self._recall_text), ("饭量", self._appetite_text),
+                               ("提醒", self._reminder_text)):
+            frame = tk.Frame(notebook, bg="#ffffff")
+            text = tk.Text(frame, wrap="word", relief="flat", font=("Microsoft YaHei", 10), padx=10, pady=8)
+            text.pack(fill="both", expand=True)
+            try:
+                text.insert("end", builder())
+            except Exception as exc:
+                text.insert("end", f"读不出来：{exc}")
+            text.configure(state="disabled")
+            notebook.add(frame, text=title)
+        bar = tk.Frame(self, bg="#eef3ff")
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Button(bar, text="打开原始 memory.json", command=self._open_raw, relief="flat",
+                  bg="#dbe7ff").pack(side="right")
+
+    # ---------- 记得的事 ----------
+    def _facts_tab(self, notebook, ttk) -> None:
+        from memory import freshness
+        frame = tk.Frame(notebook, bg="#ffffff")
+        columns = ("date", "text", "key", "imp", "fresh", "state")
+        tree = ttk.Treeview(frame, columns=columns, show="headings", height=16)
+        for col, title, width in (("date", "日期", 90), ("text", "内容", 320), ("key", "事实键", 110),
+                                  ("imp", "重要度", 60), ("fresh", "鲜活度", 60), ("state", "状态", 70)):
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor="w" if col == "text" else "center")
+        tree.pack(fill="both", expand=True)
+        self.tree = tree
+        buttons = tk.Frame(frame, bg="#ffffff")
+        buttons.pack(fill="x", pady=4)
+        for label, command in (("删掉这条", self._forget), ("更重要", lambda: self._importance(+1)),
+                               ("没那么重要", lambda: self._importance(-1))):
+            tk.Button(buttons, text=label, command=command, relief="flat", bg="#e6efff").pack(side="left", padx=4)
+        notebook.add(frame, text="记得的事")
+        self._freshness = freshness
+        self._fill_facts()
+
+    def _fill_facts(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        store = self.app.brain.memory_store
+        for fact in sorted(store.facts, key=lambda f: f.get("time", 0), reverse=True):
+            self.tree.insert("", "end", values=(
+                fact.get("ts") or "", fact.get("text", ""), fact.get("key") or "",
+                fact.get("importance", 1), f"{self._freshness(fact):.0%}",
+                "已被取代" if fact.get("superseded") else "有效"))
+
+    def _selected_text(self) -> str:
+        selection = self.tree.selection()
+        return self.tree.item(selection[0], "values")[1] if selection else ""
+
+    def _forget(self) -> None:
+        text = self._selected_text()
+        if text and self.app.brain.memory_store.forget(text):
+            self.app.brain.memory_store.save()
+            self._fill_facts()
+
+    def _importance(self, step: int) -> None:
+        text = self._selected_text()
+        if not text:
+            return
+        store = self.app.brain.memory_store
+        current = next((int(f.get("importance", 1)) for f in store.facts if f.get("text") == text), 1)
+        store.set_importance(text, current + step)
+        store.save()
+        self._fill_facts()
+
+    # ---------- 其余标签 ----------
+    def _diary_text(self) -> str:
+        store = self.app.brain.memory_store
+        lines = ["【记忆日记】（旧对话压缩出来的）"]
+        for episode in reversed(store.episodes[-40:]):
+            lines.append(f"· {format_time(episode.get('end') or episode.get('time'))}  {episode.get('text', '')}")
+        diary_dir = DATA_DIR / "home" / "diary"
+        files = sorted(diary_dir.glob("*.md"), reverse=True)[:7] if diary_dir.exists() else []
+        if files:
+            lines.append("\n【她自己写的日记】")
+            for path in files:
+                lines.append(f"—— {path.stem} ——\n{path.read_text(encoding='utf-8', errors='ignore').strip()}")
+        return "\n".join(lines) if len(lines) > 1 else "还没有日记。聊满 40 条会压缩出第一条。"
+
+    def _mood_text(self) -> str:
+        state = self.app.living.state
+        n = state.needs
+        lines = [f"现在：{state.summary()}",
+                 f"饿 {n['hunger']:.0f} · 精力 {n['energy']:.0f} · 心情 {n['mood']:.0f} · 无聊 {n['boredom']:.0f} · 想主人 {n['social']:.0f}",
+                 "情绪余温：" + ("、".join(f"{k} {v:.1f}" for k, v in state.feelings.items()) or "平静"),
+                 "\n【心情时间线】"]
+        for entry in reversed(state.mood_log[-30:]):
+            when = time.strftime("%m-%d %H:%M", time.localtime(entry.get("time", 0)))
+            lines.append(f"· {when}  {entry.get('delta', 0):+d} {entry.get('emotion', '')}  —— {entry.get('reason', '')}")
+        return "\n".join(lines)
+
+    def _recall_text(self) -> str:
+        recall = self.app.brain.memory_store.last_recall or {}
+        if not recall:
+            return "还没有召回记录（下次聊天后再看）。"
+        lines = [f"问的是：{recall.get('query', '')}"]
+        for item in recall.get("items", []):
+            mark = "✓ 想起来了" if item.get("chosen") else f"✗ {item.get('why', '')}"
+            lines.append(f"· {item.get('text', '')}  （相关 {item.get('score', 0)}，鲜活 {item.get('fresh', 0)}）  {mark}")
+        return "\n".join(lines)
+
+    def _appetite_text(self) -> str:
+        appetite = self.app.appetite
+        lines = [appetite.summary(), "", "【今天按用途】"]
+        for purpose, tokens in (appetite.data.get("eaten") or {}).items():
+            lines.append(f"· {purpose}: {tokens}")
+        history = appetite.data.get("history") or []
+        if history:
+            lines.append("\n【前几天】")
+            lines.extend(f"· {h.get('day')}: {h.get('eaten', 0)} token（缓存 {h.get('hit', 0)}）" for h in reversed(history[-14:]))
+        return "\n".join(lines)
+
+    def _reminder_text(self) -> str:
+        items = self.app.reminders.upcoming(20)
+        if not items:
+            return "没有待提醒的事。跟她说「明天下午三点提醒我开会」试试。"
+        return "\n".join(f"· {self.app.reminders.describe(i)}：{i.get('text', '')}" for i in items)
+
+    def _open_raw(self) -> None:
+        try:
+            os.startfile(str(BASE / "memory.json"))
+        except Exception as exc:
+            self.app.bubble.show(f"打不开：{exc}", 3000)
+
+
 # --------------------------------------------------------------------------- 主程序
 class PetApp:
     def __init__(self, demo: bool = False, hidden: bool = False):
@@ -1472,6 +1621,17 @@ class PetApp:
         self.bubble = Bubble(self.canvas, self.W)
 
         self.brain = Brain(BASE, self.config, log=log)
+        # 她吃的是 token：真实用量记账，自己花的从零食额度扣（appetite.json，个人数据）
+        from appetite import Appetite
+        life_cfg = self.config.get("life") if isinstance(self.config.get("life"), dict) else {}
+        self.appetite = Appetite(DATA_DIR / "appetite.json",
+                                 daily_snack=int(life_cfg.get("daily_snack_tokens") or 4000), log=log)
+        self.brain.appetite = self.appetite
+        # 约定与提醒：她答应「到时候提醒你」就真的提醒（reminders.json，个人数据）
+        from reminders import ReminderBook
+        self.reminders = ReminderBook(DATA_DIR / "reminders.json", log=log)
+        self.appetite.listeners.append(
+            lambda tokens, purpose: self.root.after(0, self._ate_tokens, tokens, purpose))
         self.asr = ASR(language=self.config.get("asr_language", "zh-CN"), log=log)
         self.voice = VoiceEngine(self.root, ASSETS, CACHE, self.config, log=log,
                                  on_speaking=self._on_speaking)
@@ -1542,13 +1702,16 @@ class PetApp:
         self._bind_events()
         # 住在桌面上：窗口当平台、自己过日子（生活状态存 life.json，她写的东西在 home/）
         from living import Living
-        self.living = Living(self, BASE / "life.json", BASE / "home", log=log)
+        self.living = Living(self, DATA_DIR / "life.json", DATA_DIR / "home", log=log)
         self.menu = self._build_menu()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
         self.animator.play(self.library.best("idle"))
         self.root.after(700, self._startup)
         self.living.start()
+        self._pet_state: dict = {}
+        self._refresh_pet_state()
+        self.root.after(5000, self._reminder_tick)
         self.root.after(1500, self._save_rect)
         self.root.after(1300, self._poll_dsh_status)
         self.root.after(8000, self._proactive_tick)
@@ -1726,6 +1889,15 @@ class PetApp:
             if doing:
                 parts.append(f"你{doing}")
             parts.append(f"你现在{living.state.summary()}")
+            unsaid = living.state.pop_unsaid()  # 上一轮心里那一下，只告诉她一次
+            if unsaid:
+                parts.append(unsaid)
+        upcoming = self.reminders.summary(2) if getattr(self, "reminders", None) else ""
+        if upcoming:
+            parts.append(f"你记着的提醒：{upcoming}")
+        appetite = getattr(self, "appetite", None)
+        if appetite is not None and appetite.hungry_for_tokens():
+            parts.append("你的 token 零食额度快吃光了，有点饿")
         try:
             import desktop
             label = desktop.guess_activity(desktop.foreground_title())
@@ -1733,10 +1905,28 @@ class PetApp:
                 parts.append(f"主人好像在{label}")
         except Exception:
             pass
-        return "；".join(parts)[:70]
+        return "；".join(parts)[:160]
+
+    def _reminder_note(self, text: str) -> str:
+        """主人让她提醒：先在本地把提醒排好，再告诉她结果（她就不会空口答应做不到的事）。"""
+        from reminders import ASK_RE
+        if not ASK_RE.search(str(text or "")):
+            return ""
+        added = self.reminders.add_from_text(text)
+        if added is None:
+            return "主人想让你提醒他，但没说清什么时候，问他具体时间（比如明天几点）"
+        if not added:
+            return "主人说的那个时间已经过了，跟他确认一下"
+        # 每个时间点写清是干什么的：只给一串时间，她会把「事后追问」当成事情本身的时间（实测过）
+        plan = "；".join(self.reminders.describe(i) for i in added)
+        log(f"记下提醒：{added[0]['event']} → {plan}")
+        return f"你刚刚记下了「{added[0]['event']}」的提醒（{plan}），到点系统会自动提醒主人，可以放心答应，简单说一下就行"
 
     def ask_agent(self, text: str, on_reply=None) -> None:
         self.brain.live_context = self.live_context()
+        note = self._reminder_note(text)
+        if note:
+            self.brain.live_context += "；" + note
         if getattr(self, "agent", None) is None:
             self.ask(text, on_reply)
             return
@@ -1755,6 +1945,7 @@ class PetApp:
             log(f"Agent 执行失败：{exc}")
             result = {"source": "error", "error": str(exc), "reply": "", "steps": []}
         if result.get("source") == "agent" and result.get("reply"):
+            result["reply"] = self.brain.absorb_mood(str(result.get("reply") or ""))  # 拆掉〔心情〕标记
             try:
                 self.brain.note_exchange(text, str(result.get("reply") or ""))  # Agent 聊天也进记忆
             except Exception as exc:
@@ -1994,12 +2185,14 @@ class PetApp:
         menu.add_checkbutton(label="📮  公众号接入", variable=self.wechat_var,
                              command=self.toggle_wechat)
         menu.add_command(label="📡  公众号状态", command=self.show_wechat_status)
-        menu.add_command(label="💰  API 余额", command=self.check_balance)
+        menu.add_command(label="🍚  看看饭碗（余额与今天吃了多少 token）", command=self.check_balance)
         menu.add_command(label="🧠  看她的记忆", command=self.show_memory)
         self.roam_var = tk.BooleanVar(value=bool(self.living.cfg.get("enabled", True)))
         menu.add_checkbutton(label="🏠  住在桌面上（自己生活）", variable=self.roam_var,
                              command=self.toggle_living)
         menu.add_command(label="📂  打开她的小窝", command=self.open_home)
+        self.body3d_var = tk.BooleanVar(value=False)
+        menu.add_checkbutton(label="🧊  3D 身体（实验）", variable=self.body3d_var, command=self.toggle_body3d)
         self.auto_approve_var = tk.BooleanVar(
             value=bool((self.config.get("agent") or {}).get("auto_approve")))
         menu.add_checkbutton(label="🔓  全权限托管（危险）", variable=self.auto_approve_var,
@@ -2259,6 +2452,9 @@ class PetApp:
         counts = self.config.setdefault("feed_counts", {})
         counts[food] = int(counts.get(food, 0)) + 1
         self.living.event(f"fed:{food}")
+        granted = self.appetite.feed(food)  # 投喂 = 给她一份能自己花的 token 零食额度
+        self.root.after(3400, lambda: self.bubble.show(
+            f"（零食额度 +{granted} token，现在有 {self.appetite.allowance}）", 2600))
         if food == "rice":
             self._rice_count += 1
             self.config["rice_count"] = self._rice_count
@@ -2453,11 +2649,21 @@ class PetApp:
             text = result.get("text") or "余额查询没有结果。"
         except Exception as exc:
             text = f"查余额失败：{exc}"
-        self.root.after(0, lambda: self.bubble.show(str(text), 6000))
-        log(str(text))
+        text = f"{str(text).replace('API 余额', '饭碗里还有')}\n{self.appetite.summary()}"
+        self.root.after(0, lambda: self.bubble.show(text, 7000))
+        log(text.replace("\n", " · "))
+
+    def _ate_tokens(self, tokens: int, purpose: str) -> None:
+        """吃了一口 token：饿的程度往下掉（每 1000 token 约 8 点）。"""
+        living = getattr(self, "living", None)
+        if living is not None:
+            living.state.needs["hunger"] = max(0.0, living.state.needs["hunger"] - tokens / 1000 * 8)
 
     # ---------- 通到 QQ（OneBot HTTP） ----------
     def _qq_reply(self, text: str) -> str:
+        note = self._reminder_note(text)  # QQ 里让她提醒也算数（到点在桌面上提醒）
+        if note:
+            self.brain.live_context = self.live_context() + "；" + note
         try:
             reply, source = self.brain.reply(text)
         except Exception as exc:
@@ -2523,8 +2729,77 @@ class PetApp:
             self.living.dropped()
         self.bubble.show("好呀，本鲸自己在桌面上过日子啦～" if on else "那本鲸乖乖待在这儿不动。", 2600)
 
+    # ---------- 3D 身体（body3d/，Electron）：大脑还是这里，身体换成 3D ----------
+    def _refresh_pet_state(self) -> None:
+        living = getattr(self, "living", None)
+        self._pet_state = {
+            "emotion": self._emotion or "idle",
+            "speaking": bool(self._speaking),
+            "bubble": getattr(self.bubble, "current_text", "") or "",
+            "activity": getattr(living, "activity", "idle") if living else "idle",
+            "mood": round(living.state.needs["mood"]) if living else 60,
+            "feeling": living.state.top_feeling() if living else "",
+            "name": self.display_name,
+        }
+        self.root.after(200, self._refresh_pet_state)
+
+    def _reminder_tick(self) -> None:
+        """每 20 秒看看有没有到点的提醒：气泡 + 念出来 + 挥手；聊天窗开着就也发一条。"""
+        try:
+            for item in self.reminders.due():
+                text = item["text"]
+                self.bubble.show(text, 9000)
+                self.voice.speak(text)
+                self._set_emotion("wave", duration_ms=3000)
+                for window in (self.chat_window, self.quick_chat):
+                    try:
+                        if window is not None and window.winfo_exists():
+                            window.append("her", self.display_name, f"⏰ {text}")
+                    except Exception:
+                        pass
+                log(f"提醒到点：{text}")
+        except Exception as exc:
+            log(f"提醒检查失败：{exc}")
+        self.root.after(20000, self._reminder_tick)
+
+    def _pet_event(self, kind: str) -> bool:
+        """3D 身体上的点击（在 HTTP 线程里调用，切回主线程执行）。"""
+        actions = {"pat": self.pat, "open_chat": self.open_chat,
+                   "back_2d": lambda: (self.body3d_var.set(False), self.toggle_body3d())}  # 3D 窗口右键「回到 2D」
+        if kind.startswith("feed:"):
+            food = kind.split(":", 1)[1]
+            actions[kind] = lambda: self.feed(food)
+        action = actions.get(kind)
+        if action is None:
+            return False
+        self.root.after(0, action)
+        return True
+
+    def toggle_body3d(self) -> None:
+        if self.body3d_var.get():
+            start = BASE.parent / "body3d" / "start.bat"
+            if not start.exists():
+                self.body3d_var.set(False)
+                self.bubble.show("3D 身体还没装好（body3d/）", 3000)
+                return
+            if self.shared_server is None:
+                self.start_shared_brain()  # 3D 身体靠共用大脑接口拿状态
+            import subprocess
+            self._body3d_proc = subprocess.Popen(["cmd", "/c", str(start)], cwd=str(start.parent),
+                                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.root.withdraw()
+            log("3D 身体已启动，2D 窗口收起")
+        else:
+            proc = getattr(self, "_body3d_proc", None)
+            if proc is not None:
+                import subprocess
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+                self._body3d_proc = None
+            self.root.deiconify()
+            log("3D 身体已关闭，回到 2D")
+
     def open_home(self) -> None:
-        home = BASE / "home"
+        home = DATA_DIR / "home"
         home.mkdir(parents=True, exist_ok=True)
         try:
             os.startfile(str(home))
@@ -2562,16 +2837,12 @@ class PetApp:
             self.bubble.show("全权限托管关了，动手前会再问你。", 3000)
 
     def show_memory(self) -> None:
-        path = BASE / "memory.json"
-        try:
-            summary = self.brain.memory_store.summary()
-        except Exception:
-            summary = "记忆读取失败"
-        self.bubble.show(summary, 6000)
-        try:
-            os.startfile(str(path))
-        except Exception as exc:
-            self.bubble.show(f"打不开记忆文件：{exc}", 3000)
+        """记忆窗口：记得的事（可删/调重要度）、日记、心情、最近一次召回、饭量、提醒。"""
+        window = getattr(self, "memory_window", None)
+        if window is not None and window.winfo_exists():
+            window.lift()
+            return
+        self.memory_window = MemoryWindow(self)
 
     # ---------- 自主小动作 / 相处笔记 / 喊名字唤醒 ----------
     def _autonomy_tick(self) -> None:
@@ -2668,6 +2939,8 @@ class PetApp:
             log(f"共用大脑模块不可用：{exc}")
             return
         server = SharedBrainServer(self.brain, self.config, log=log)
+        server.state_provider = lambda: self._pet_state  # 主线程每 200ms 刷新，这里只读引用
+        server.event_handler = self._pet_event
         ok, message = server.start()
         if ok:
             self.shared_server = server
@@ -2952,6 +3225,9 @@ class PetApp:
     # ---------- 大脑 ----------
     def ask(self, text: str, on_reply=None) -> None:
         self.brain.live_context = self.live_context()
+        note = self._reminder_note(text)
+        if note:
+            self.brain.live_context += "；" + note
         self._busy = True
         self._touch()
         self._last_user_text = str(text or "")
@@ -2975,6 +3251,11 @@ class PetApp:
         self.living.event("chat")
         # 回复里写了（尾巴一甩）（捂脸）这类小动作，就真的做出来，而不是一律「说话」动画
         acted = state_for_actions(reply) if source != "offline-error" else None
+        mood, self.brain.last_mood = getattr(self.brain, "last_mood", None), None
+        if mood:  # 回复末尾的〔心情 ±N 情绪〕：记进她的心情，情绪也能决定动作
+            delta, feeling = mood
+            self.living.state.feel(delta, feeling, reason=self._last_user_text)
+            acted = acted or MOOD_STATES.get(feeling)
         if acted:
             emotion = acted if acted in PARTICLE_SPECS else emotion
         self._emotion = emotion
@@ -3064,6 +3345,12 @@ class PetApp:
             self.living.save()
         except Exception:
             pass
+        if getattr(self, "_body3d_proc", None) is not None:  # 3D 身体跟着一起关
+            try:
+                self.body3d_var.set(False)
+                self.toggle_body3d()
+            except Exception:
+                pass
         try:
             if getattr(self, "wechat_server", None) is not None:
                 self.wechat_server.stop()

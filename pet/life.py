@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 ACTIVITIES = ("idle", "stroll", "climb_window", "peek_edge", "nap", "snack",
-              "dance", "browse_file", "write_diary", "call_master")
+              "dance", "browse_file", "write_diary", "call_master", "chase_mouse")
 
 DEFAULT_NEEDS = {"hunger": 30.0, "energy": 80.0, "mood": 70.0, "boredom": 20.0, "social": 30.0}
 MAX_OFFLINE_MINUTES = 12 * 60
@@ -39,6 +39,7 @@ EVENTS = {
     "snack": {"hunger": -25, "mood": 4},
 }
 FOOD_FILL = {"rice": 35, "fish": 20, "cake": 25, "tangyuan": 20, "diamond": 5}
+FEELING_HALF_LIFE_MIN = 180.0
 
 
 def _clamp(value: float) -> float:
@@ -69,6 +70,11 @@ class LifeState:
         self.diary_day: str = str(extra.get("diary_day") or "")
         self.recent: list[str] = [a for a in (extra.get("recent") or []) if a in ACTIVITIES][-4:]
         self.asleep: bool = bool(extra.get("asleep", False))
+        # 心情起伏（思路参考 Yuuyuko-uu/dsh-feiyu-mood，MIT）：每轮聊完的涨跌、当下的情绪、时间线
+        self.feelings: dict[str, float] = {k: float(v) for k, v in (extra.get("feelings") or {}).items()
+                                           if isinstance(v, (int, float))}
+        self.mood_log: list[dict] = [e for e in (extra.get("mood_log") or []) if isinstance(e, dict)][-60:]
+        self.unsaid: str = str(extra.get("unsaid") or "")
 
     # ---------- 存取 ----------
     @classmethod
@@ -89,7 +95,8 @@ class LifeState:
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {"needs": {k: round(v, 2) for k, v in self.needs.items()}, "last_update": self.last_update,
                 "last_done": self.last_done, "diary_day": self.diary_day, "recent": self.recent,
-                "asleep": self.asleep}
+                "asleep": self.asleep, "feelings": {k: round(v, 2) for k, v in self.feelings.items()},
+                "mood_log": self.mood_log[-60:], "unsaid": self.unsaid}
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(tmp, path)
@@ -115,7 +122,40 @@ class LifeState:
         drag = (max(0, self.needs["hunger"] - 60) + max(0, 40 - self.needs["energy"])
                 + max(0, self.needs["boredom"] - 60) + max(0, self.needs["social"] - 60)) / 100.0
         self.needs["mood"] = _clamp(self.needs["mood"] + (0.05 - 0.4 * drag) * minutes)
+        # 情绪慢慢回稳：半衰期 3 小时（被夸的开心 +6，3 小时后剩 +3）
+        fade = 0.5 ** (minutes / FEELING_HALF_LIFE_MIN)
+        self.feelings = {k: v * fade for k, v in self.feelings.items() if abs(v * fade) >= 0.3}
         return minutes
+
+    def feel(self, delta: int, emotion: str, reason: str = "", now: float | None = None) -> None:
+        """一轮聊完的心情涨跌（来自回复末尾的〔心情 ±N 情绪〕）。没变化不记账；变化只在下一轮告诉她一次。"""
+        try:
+            delta = max(-3, min(3, int(delta)))
+        except (TypeError, ValueError):
+            return
+        emotion = str(emotion or "").strip()[:4]
+        if delta == 0 and not emotion:
+            return
+        now = float(now or time.time())
+        self.needs["mood"] = _clamp(self.needs["mood"] + delta * 4)
+        if emotion and emotion != "平静":
+            self.feelings[emotion] = self.feelings.get(emotion, 0.0) + abs(delta) * 2 + 1
+        if delta != 0:
+            self.mood_log.append({"time": now, "delta": delta, "emotion": emotion, "reason": str(reason)[:40],
+                                  "mood": round(self.needs["mood"], 1)})
+            self.mood_log = self.mood_log[-60:]
+            sign = "好了一点" if delta > 0 else "低落了一点"
+            self.unsaid = f"你刚才心里{sign}（{emotion or '说不清'}）"
+
+    def pop_unsaid(self) -> str:
+        text, self.unsaid = self.unsaid, ""
+        return text
+
+    def top_feeling(self) -> str:
+        if not self.feelings:
+            return ""
+        name, value = max(self.feelings.items(), key=lambda kv: kv[1])
+        return name if value >= 1.5 else ""
 
     def on_event(self, kind: str) -> None:
         kind = str(kind or "")
@@ -163,6 +203,7 @@ class LifeState:
             "snack": max(0.0, n["hunger"] - 45) * 1.3,
             "dance": max(0.0, n["mood"] - 60) * 0.5 + n["boredom"] * 0.15,
             "browse_file": n["boredom"] * 0.35,
+            "chase_mouse": n["boredom"] * 0.25 + max(0.0, n["mood"] - 60) * 0.2,  # 追着主人的鼠标跑
             "write_diary": 0.0,
             "call_master": max(0.0, n["social"] - 55) * 1.4,
         }
@@ -226,5 +267,7 @@ class LifeState:
             parts.append("很想主人" if n["social"] >= 80 else "有点想主人")
         if n["boredom"] >= 65:
             parts.append("闲得发慌")
-        parts.append("心情好" if n["mood"] >= 70 else "心情一般" if n["mood"] >= 40 else "心情低落")
+        feeling = self.top_feeling()
+        parts.append(f"有点{feeling}" if feeling else
+                     "心情好" if n["mood"] >= 70 else "心情一般" if n["mood"] >= 40 else "心情低落")
         return "，".join(parts)[:40]

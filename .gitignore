@@ -6,6 +6,8 @@ pet/memory.json.bak
 pet/PARTNER.md
 pet/learned_notes.md
 pet/life.json
+pet/appetite.json
+pet/reminders.json
 pet/home/
 pet/.window_rect.json
 pet/logs/
@@ -14,6 +16,11 @@ docs/
 # 下载/构建出来的第三方素材（各自许可，不随仓库分发）
 pet/assets/
 research/
+body3d/models/
+# 本机工具与依赖（便携 Node、图生 3D、npm 依赖、Electron 用户数据）
+.tools/
+body3d/node_modules/
+body3d/.userdata/
 # Python / 杂项
 __pycache__/
 *.pyc

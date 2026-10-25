@@ -29,9 +29,9 @@ import urllib.request
 from pathlib import Path
 
 try:  # 常规用法：桌宠把 pet/ 放进 sys.path 后直接 import brain
-    from memory import CONSOLIDATE_BATCH, MemoryStore, format_time
+    from memory import CONSOLIDATE_BATCH, FACTS_PER_DAY, MemoryStore, format_time, freshness
 except ImportError:  # 兜底：把 pet/ 当包导入时
-    from .memory import CONSOLIDATE_BATCH, MemoryStore, format_time
+    from .memory import CONSOLIDATE_BATCH, FACTS_PER_DAY, MemoryStore, format_time, freshness
 
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
@@ -258,12 +258,41 @@ def _clamp_int(value, default: int, low: int, high: int) -> int:
     return max(low, min(high, number))
 
 
+# 心情顺带输出：不另外调模型判心情，回复末尾多写一行标记，前端拆掉不给主人看
+MOOD_INSTRUCTION = ("【必须】每次回复的最后一行单独写心情标记，格式〔心情 ±N 情绪〕，例如：\n"
+                    "嘿嘿，被夸了。\n〔心情 +2 得意〕\n"
+                    "N 是 -3 到 +3 的整数，情绪选 开心/害羞/得意/想念/委屈/难过/担心/平静 之一；这行主人看不到。"
+                    "心情往下只能因为心疼、担心或你自己难过，不许因为主人惹你就记仇。")
+MOOD_RE = re.compile(r"\s*[〔\[【(（]\s*心情\s*([+＋\-－−]?\s*\d)\s*([一-鿿]{0,4})\s*[〕\]】)）]\s*")
+
+
+def split_mood(reply: str) -> tuple[str, tuple[int, str] | None]:
+    """从回复里拆出心情标记；返回 (去掉标记的回复, (涨跌, 情绪) 或 None)。标记写在哪都拆，只认最后一个。"""
+    text = str(reply or "")
+    matches = list(MOOD_RE.finditer(text))
+    if not matches:
+        return text.strip(), None
+    last = matches[-1]
+    raw = re.sub(r"\s", "", last.group(1)).replace("＋", "+").replace("－", "-").replace("−", "-")
+    try:
+        delta = max(-3, min(3, int(raw)))
+    except ValueError:
+        delta = 0
+    clean = MOOD_RE.sub(" ", text).strip()
+    return clean, (delta, last.group(2) or "")
+
+
 class Brain:
     def __init__(self, base_dir: Path, config: dict, log=print):
         self.dir = Path(base_dir)
         self.config = config if isinstance(config, dict) else {}
         self.log = log if callable(log) else print
         self.persona = self._read_persona()
+        self.last_mood: tuple[int, str] | None = None
+        self.mood_instruction = MOOD_INSTRUCTION  # Agent 的 system prompt 也拼这句
+        self.appetite = None  # app 接上 Appetite：记饭量、管她自己花 token 的零食额度
+        import threading
+        self._tl = threading.local()  # 本线程这次调模型是为了什么（chat/remark/diary/proactive/memory）
 
         # 记忆：MemoryStore 持有结构化数据；self.memory 继续暴露原始 dict，
         # 兼容旧代码（app.py 设置窗会直接写 brain.memory["user_name"]）。
@@ -308,6 +337,7 @@ class Brain:
     # ---------- 对外：聊天 ----------
     def reply(self, text: str) -> tuple[str, str]:
         """返回 (回复文字, 来源)；来源：llm / offline / offline-error。"""
+        self.last_mood = None  # 每轮重新算，别把上一轮（或 QQ 那边）的心情串过来
         text = (text or "").strip()
         if not text:
             return ("你还没说话呢。", "offline")
@@ -463,7 +493,7 @@ class Brain:
         recent = list(self.memory_store.proactive_recent)
         candidates = self._proactive_candidates(ctx)
         line = ""
-        if self._llm_ready():
+        if self._llm_ready() and self._afford("proactive", 400):
             try:
                 line = self._clean_line(self._proactive_llm(ctx, recent))
             except Exception as exc:
@@ -480,13 +510,21 @@ class Brain:
         self._save_memory()
         return line
 
+    def _afford(self, purpose: str, estimate: int = 600) -> bool:
+        """她自己想花 token：零食额度不够就不调模型（调用方走离线兜底）。"""
+        if self.appetite is not None and not self.appetite.can_afford(purpose, estimate):
+            self.log(f"零食额度不够（{purpose}），这次不调模型")
+            return False
+        self._tl.purpose = purpose
+        return True
+
     def remark(self, task: str, material: str = "", max_tokens: int = 90) -> str | None:
         """桌面生活用的一次性小调用（翻文件嘀咕一句、写日记）。
 
         只带人设（与聊天同前缀，能吃到前缀缓存）+ 任务 + 截断的素材，不带对话历史；
-        没模型或失败返回 None，调用方用离线台词兜底。
+        没模型、零食额度不够或失败都返回 None，调用方用离线台词兜底。
         """
-        if not self._llm_ready():
+        if not self._llm_ready() or not self._afford("diary" if max_tokens > 120 else "remark"):
             return None
         try:
             key, _source = self._resolve_api_key()
@@ -540,6 +578,8 @@ class Brain:
         lines.append("回答要求：中文口语，一般一两句，长短随话题；不写列表和 Markdown；不确定就说不确定。")
         lines.append("")
         lines.append(self.memory_block(query, include_personal=True))
+        lines.append("")
+        lines.append(MOOD_INSTRUCTION)  # 放最后：放在中间会被记忆块冲淡，实测模型直接不写
         return "\n".join(line for line in lines if line is not None)
 
     def memory_block(self, query: str = "", include_personal: bool = True) -> str:
@@ -559,8 +599,10 @@ class Brain:
         facts = store.relevant(query, 5) if query else []
         fact_lines = [item["detail"] for item in facts if item["type"] == "fact"]
         history_lines = [item["detail"] for item in facts if item["type"] == "history"]
-        if not fact_lines and store.facts:
-            ranked = sorted(store.facts, key=lambda f: (int(f.get("importance", 1)), f.get("time", 0)), reverse=True)
+        if not fact_lines and store.active_facts:  # 没有贴题的：放几条最重要、最鲜活的打底
+            now = time.time()
+            ranked = sorted(store.active_facts,
+                            key=lambda f: int(f.get("importance", 1)) * 2 + freshness(f, now), reverse=True)
             fact_lines = [f"[记得] {f.get('text', '')}" for f in ranked[:4]]
         if fact_lines:
             store.mark_used([line.split("] ", 1)[-1] for line in fact_lines])
@@ -604,6 +646,33 @@ class Brain:
         return text
 
     # ---------- 学习与记忆 ----------
+    def _diary_context(self) -> str:
+        """压缩前先翻翻日记：最近几条记忆日记 + 她小窝里最新一篇 + 已记得的事。新日记接着写、事实别重复。"""
+        parts = []
+        episodes = self.memory_store.episodes[-3:]
+        if episodes:
+            parts.append("【之前的日记（接着往下写，别重复）】\n" + "\n".join(
+                f"- {format_time(e.get('end') or e.get('time'))} {e.get('text', '')}" for e in episodes))
+        diary_dir = self.dir / "home" / "diary"
+        try:
+            latest = max(diary_dir.glob("*.md"), key=lambda p: p.name, default=None)
+            if latest is not None:
+                text = latest.read_text(encoding="utf-8", errors="ignore").strip()[-300:]
+                if text:
+                    parts.append(f"【你自己写的最新日记（{latest.stem}）】\n{text}")
+        except OSError:
+            pass
+        facts = [f.get("text", "") for f in self.memory_store.active_facts[-8:]]
+        if facts:
+            parts.append("【已经记得的事（别重复记；有变化就用同一个 key 记新的）】\n" + "；".join(facts))
+        return ("\n".join(parts) + "\n") if parts else ""
+
+    def _facts_per_day(self) -> int:
+        try:
+            return int((self.config.get("memory") or {}).get("facts_per_day") or FACTS_PER_DAY)
+        except (TypeError, ValueError):
+            return FACTS_PER_DAY
+
     @staticmethod
     def _is_question(text: str) -> bool:
         text = text or ""
@@ -614,7 +683,8 @@ class Brain:
         added: list[dict] = []
 
         def add(value: str, kind: str) -> None:
-            if self.memory_store.add_fact(value, kind):
+            # 主人亲口说的（我叫/我喜欢/记住…）：重要度 2，不受每日上限
+            if self.memory_store.add_fact(value, kind, importance=2):
                 added.append({"text": value, "kind": kind})
 
         name = _NAME_RE.search(text)
@@ -688,7 +758,7 @@ class Brain:
         end = float(turns[-1].get("time") or 0.0)
         transcript = "\n".join(f"{'主人' if t['role'] == 'user' else '我'}：{t['content'][:120]}" for t in turns)
         diary, facts = "", []
-        if self._llm_ready():
+        if self._llm_ready() and self._afford("memory", 800):  # 没零食额度就摘抄兜底，记忆照样不丢
             try:
                 key, _source = self._resolve_api_key()
                 options = dict(self._llm_options())
@@ -698,9 +768,10 @@ class Brain:
                     {"role": "user", "content": (
                         "把下面这段对话压成：\n"
                         '{"diary": "以「我」的口吻写的一句日记，≤60 字，记发生了什么和主人的情绪", '
-                        '"facts": [{"kind": "like|dislike|event|note", "text": "关于主人、值得长期记住的事，≤30 字", '
-                        '"importance": 1到3}]}\n'
-                        "facts 最多 3 条，没有就空数组；别记寒暄。\n\n" + transcript)},
+                        '"facts": [{"kind": "like|dislike|event|note", "text": "关于主人、值得长期记住的事，≤30 字，有日期就写上", '
+                        '"importance": 1到3, "key": "对象.方面，如 主人.考试 / 主人.住处 / 约定.周末"}]}\n'
+                        "facts 最多 3 条，没有就空数组；别记寒暄。key 只写对象和方面、不写具体值（写「主人.身高」不写「主人.身高170」），"
+                        "拿不准就留空字符串。\n" + self._diary_context() + "\n【这段对话】\n" + transcript)},
                 ]
                 raw = self._request_chat_with_retries(messages, options, key)
                 match = re.search(r"\{.*\}", str(raw or ""), re.S)
@@ -721,7 +792,8 @@ class Brain:
             except (TypeError, ValueError):
                 importance = 2
             self.memory_store.add_fact(str(fact.get("text") or ""), str(fact.get("kind") or "note"),
-                                       importance=importance)
+                                       importance=importance, key=str(fact.get("key") or ""),
+                                       daily_cap=self._facts_per_day())
         self._save_memory()
         self.log(f"记忆压缩：{len(turns)} 条对话 → 日记「{diary[:30]}」，事实 {len(facts)} 条")
         return diary
@@ -784,10 +856,17 @@ class Brain:
         key, _source = self._resolve_api_key()
         if not key:
             raise LLMError("没有找到 API Key")
+        self._tl.purpose = "chat"  # 主人找她聊：算吃饭，不扣零食额度
         options = self._llm_options()
         messages = self._build_messages(text)
         answer = self._request_chat_with_retries(messages, options, key)
-        return self._clean_line(answer)
+        return self._clean_line(self.absorb_mood(answer))  # 先拆心情标记，_clean_line 只留第一行
+
+    def absorb_mood(self, reply: str) -> str:
+        """拆掉回复末尾的〔心情 ±N 情绪〕，记到 last_mood（app 拿去更新她的心情）；返回干净的回复。"""
+        clean, mood = split_mood(reply)
+        self.last_mood = mood
+        return clean
 
     def _request_chat_with_retries(self, messages: list[dict], options: dict, key: str) -> str:
         last_error: LLMError | None = None
@@ -841,14 +920,17 @@ class Brain:
             data = json.loads(raw.decode("utf-8"))
         except Exception:
             raise LLMError("模型接口返回了无法解析的内容", retryable=False) from None
+        if self.appetite is not None and isinstance(data, dict):  # 这一口吃了多少 token
+            self.appetite.eat(data.get("usage"), getattr(self._tl, "purpose", "chat"))
         try:
             answer = (data["choices"][0]["message"]["content"] or "").strip()
         except (KeyError, IndexError, TypeError):
             raise LLMError("模型接口返回格式不正确", retryable=False) from None
-        answer = self._clean_line(answer)
-        if not answer:
+        # 返回原文，不在这里只留第一行：心情标记在最后一行、压缩的 JSON 和日记可能跨行，
+        # 之前在这里 _clean_line 会把它们截掉。只要一行的调用方自己 _clean_line。
+        if not answer.strip():
             raise LLMError("模型返回了空内容", retryable=True)
-        return answer[:600]
+        return answer[:1200]
 
     @staticmethod
     def _http_error_detail(code: int) -> str:

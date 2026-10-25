@@ -27,6 +27,7 @@ CONFIG = {
 CONFIG_PATH = TMP / "config.json"
 CONFIG_PATH.write_text(json.dumps(CONFIG, ensure_ascii=False), encoding="utf-8")
 os.environ["DFY_CONFIG"] = str(CONFIG_PATH)
+os.environ["DFY_DATA_DIR"] = str(TMP)  # 饭量账本、生活状态、小窝都写临时目录
 
 sys.path.insert(0, str(PET))
 import app as petapp  # noqa: E402
@@ -54,7 +55,9 @@ def _assert(cond: bool, message: str) -> None:
 
 def main() -> int:
     real_config = PET / "config.json"
-    real_before = real_config.read_bytes() if real_config.exists() else b""
+    # 正在运行的桌宠会写 life.json / memory.json，这两个不在这里比，改为下面「临时目录里有」的正向检查
+    real_files = [PET / name for name in ("config.json", "appetite.json")]
+    real_before = {f: (f.read_bytes() if f.exists() else None) for f in real_files}
     log_path = PET / "logs" / "app.log"
     log_offset = log_path.stat().st_size if log_path.exists() else 0  # 只看这次运行新写的日志
     application = petapp.PetApp(hidden=True, demo=False)
@@ -88,6 +91,7 @@ def main() -> int:
         (6550, lambda: guard("reply with action", lambda: application._show_reply("（尾巴一甩）好呀", "llm", None))),
         (6580, lambda: guard("sticker", lambda: application.send_sticker("happy", force=True))),
         (6600, lambda: guard("toss", lambda: application._start_flight(1400, -900))),
+        (6700, lambda: guard("memory window", lambda: (application.show_memory(), application.memory_window.destroy()))),
         (9900, lambda: guard("eating finished", lambda: _assert(not application._eating, "吃完没复位"))),
         (10100, lambda: guard("toss landed", lambda: _assert(application._flight is None, "抛出后没落地"))),
         (10300, lambda: (application.voice.shutdown(), application.root.destroy())),
@@ -108,10 +112,14 @@ def main() -> int:
     if not states_seen:
         print("DSH 状态没全部看到：", [s for s in ("running", "tool", "success", "failure", "approval")
                                     if f"→ {s}" not in log_text])
-    real_after = real_config.read_bytes() if real_config.exists() else b""
-    if real_after != real_before:
-        errors.append("冒烟测试改动了真正的 pet/config.json（应只写 DFY_CONFIG 临时配置）")
-        print(errors[-1])
+    for f, before in real_before.items():
+        if (f.read_bytes() if f.exists() else None) != before:
+            errors.append(f"冒烟测试改动了真实的 pet/{f.name}（应只写临时目录）")
+            print(errors[-1])
+    for name in ("appetite.json",):  # life.json 要正常退出才存盘，冒烟是直接销毁窗口
+        if not (TMP / name).exists():
+            errors.append(f"{name} 没写进临时目录（DFY_DATA_DIR 没生效）")
+            print(errors[-1])
     ok = (not errors) and states_seen
     print("SMOKE:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

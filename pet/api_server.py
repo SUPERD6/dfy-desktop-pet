@@ -109,6 +109,22 @@ form.addEventListener('submit', (e) => { e.preventDefault(); send(); });
 """
 
 
+def compact_summary(messages) -> str:
+    """DSH 要求压缩上下文时的摘抄式摘要：按顺序列出双方说过的话（截短），不调模型。"""
+    lines = []
+    for item in messages if isinstance(messages, list) else []:
+        if not isinstance(item, dict) or item.get("role") not in ("user", "assistant"):
+            continue
+        content = item.get("content")
+        if isinstance(content, list):
+            content = " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        content = " ".join(str(content or "").split())
+        if content:
+            who = "主人" if item["role"] == "user" else "她"
+            lines.append(f"{who}：{content[:80]}")
+    return "之前的对话摘要：\n" + "\n".join(lines[-30:]) if lines else "（之前没有可总结的对话）"
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "DfySharedBrain/1.0"
 
@@ -130,7 +146,7 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         auth = self.headers.get("Authorization", "")
         key = auth.replace("Bearer ", "", 1).strip() if auth.startswith("Bearer ") else auth.strip()
-        return key == token
+        return key == token or self.headers.get("x-api-key", "").strip() == token  # Anthropic 风格（DSH）用 x-api-key
 
     # ---------- 路由 ----------
     def do_GET(self) -> None:  # noqa: N802
@@ -141,6 +157,13 @@ class _Handler(BaseHTTPRequestHandler):
         elif path in ("/health", "/v1/health"):
             self._send_json(200, {"ok": True, "service": "dfy-shared-brain",
                                   "time": int(time.time())})
+        elif path == "/v1/pet/state":  # 3D 身体每 200ms 来问：她现在什么情绪、在不在说话、气泡写什么
+            provider = getattr(self.server, "pet_state", None)
+            try:
+                state = provider() if callable(provider) else None
+            except Exception:
+                state = None
+            self._send_json(200, {"ok": True, **state} if isinstance(state, dict) else {"ok": False})
         elif path == "/v1/models":
             self._send_json(200, {"object": "list", "data": [
                 {"id": "dfy-companion", "object": "model", "owned_by": "dafeiyu-pet"},
@@ -162,6 +185,20 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         if not self._authorized():
             self._send_json(401, {"error": {"message": "invalid token", "type": "auth_error"}})
+            return
+        if self.path.rstrip("/") in ("/v1/messages", "/anthropic/v1/messages"):
+            self._anthropic_messages()  # DSH 0.2.x 的 DeepSeek 路由走 Anthropic Messages 格式
+            return
+        if self.path.rstrip("/") == "/v1/pet/event":  # 3D 身体被点了：摸头等
+            handler = getattr(self.server, "pet_event", None)
+            try:
+                length = min(int(self.headers.get("Content-Length") or 0), 4096)
+                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}") if length else {}
+                kind = str(body.get("kind") or "")[:32]
+            except Exception:
+                kind = ""
+            ok = bool(kind) and callable(handler) and bool(handler(kind))
+            self._send_json(200 if ok else 400, {"ok": ok})
             return
         if self.path.rstrip("/") != "/v1/chat/completions":
             self._send_json(404, {"error": {"message": "not found", "type": "not_found"}})
@@ -185,7 +222,11 @@ class _Handler(BaseHTTPRequestHandler):
                     user_text = str(content).strip()
                     break
         brain = getattr(self.server, "brain", None)
-        if not user_text or brain is None:
+        compact = self.headers.get("x-deepseek-harness-compact") == "1"
+        if compact:
+            # DSH 对话太长时让模型总结前文：这不是在跟她聊天，直接摘抄，不调模型、不进她的记忆
+            reply, source = compact_summary(messages), "compact"
+        elif not user_text or brain is None:
             reply, source = "（没有收到要回答的内容）", "error"
         else:
             try:
@@ -194,7 +235,11 @@ class _Handler(BaseHTTPRequestHandler):
                 reply, source = f"她这边出了点问题：{exc}", "error"
         log = getattr(self.server, "brain_log", None)
         if callable(log):
-            log(f"共享大脑请求：{user_text[:60]} → {source}（{len(reply)} 字）")
+            via = "DSH" if self.headers.get("x-deepseek-harness-session-id") else "接口"
+            log(f"共享大脑请求（{via}）：{user_text[:60]} → {source}（{len(reply)} 字）")
+        if payload.get("stream"):
+            self._send_stream(reply, source)
+            return
         self._send_json(200, {
             "id": f"chatcmpl-dfy-{int(time.time() * 1000)}",
             "object": "chat.completion",
@@ -208,6 +253,109 @@ class _Handler(BaseHTTPRequestHandler):
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             "dfy_source": source,
         })
+
+    # ---------- Anthropic Messages（DSH 用）----------
+    def _anthropic_messages(self) -> None:
+        """POST /v1/messages：DSH 0.2.x 的 DeepSeek 适配器（实测本机 0.2.1-rc.3）用这个格式。
+
+        只取最后一条用户消息里的文字块交给她；DSH 自己的 system、tools、thinking 参数一概不用——
+        她用自己的人设和记忆回答，聊过的话进她同一份记忆。压缩上下文请求用摘抄摘要应付，不进记忆。
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            payload = json.loads((self.rfile.read(length) if length else b"{}").decode("utf-8", errors="replace"))
+        except Exception as exc:
+            self._send_json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"bad json: {exc}"}})
+            return
+        messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+        user_text = ""
+        for item in reversed(messages):
+            if isinstance(item, dict) and item.get("role") == "user":
+                content = item.get("content")
+                if isinstance(content, list):  # 内容块：只要文字，工具结果之类跳过
+                    content = " ".join(str(b.get("text", "")) for b in content
+                                       if isinstance(b, dict) and b.get("type") == "text")
+                if str(content or "").strip():
+                    user_text = str(content).strip()
+                    break
+        brain = getattr(self.server, "brain", None)
+        if self.headers.get("x-deepseek-harness-compact") == "1":
+            reply, source = compact_summary(messages), "compact"
+        elif not user_text or brain is None:
+            reply, source = "（没有收到要回答的内容）", "error"
+        else:
+            try:
+                reply, source = brain.reply(user_text)
+            except Exception as exc:
+                reply, source = f"她这边出了点问题：{exc}", "error"
+        log = getattr(self.server, "brain_log", None)
+        if callable(log):
+            log(f"共享大脑请求（DSH/Messages）：{user_text[:60]} → {source}（{len(reply)} 字）")
+        reply = reply or "……"
+        message_id = f"msg_dfy_{int(time.time() * 1000)}"
+        usage = {"input_tokens": 0, "output_tokens": 0}
+        if not payload.get("stream"):
+            self._send_json(200, {"id": message_id, "type": "message", "role": "assistant", "model": "dfy-companion",
+                                  "content": [{"type": "text", "text": reply}], "stop_reason": "end_turn",
+                                  "stop_sequence": None, "usage": usage})
+            return
+
+        def event(kind: str, data: dict) -> bytes:
+            return f"event: {kind}\ndata: {json.dumps({'type': kind, **data}, ensure_ascii=False)}\n\n".encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            # 顺序必须严格：message_start → block start → delta… → block stop → message_delta(stop_reason) → message_stop
+            self.wfile.write(event("message_start", {"message": {
+                "id": message_id, "type": "message", "role": "assistant", "model": "dfy-companion",
+                "content": [], "stop_reason": None, "stop_sequence": None, "usage": usage}}))
+            self.wfile.write(event("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}}))
+            for start in range(0, len(reply), 12):
+                self.wfile.write(event("content_block_delta", {"index": 0, "delta": {
+                    "type": "text_delta", "text": reply[start:start + 12]}}))
+            self.wfile.write(event("content_block_stop", {"index": 0}))
+            self.wfile.write(event("message_delta", {"delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                                     "usage": {"output_tokens": 0}}))
+            self.wfile.write(event("message_stop", {}))
+            self.wfile.flush()
+        except Exception:
+            pass
+        self.close_connection = True
+
+    def _send_stream(self, reply: str, source: str) -> None:
+        """OpenAI / DeepSeek 风格的 SSE 流（DSH 的 DeepSeek 适配器只认流式，必须以 [DONE] 结尾）。"""
+        created = int(time.time())
+        chunk_id = f"chatcmpl-dfy-{int(time.time() * 1000)}"
+
+        def event(delta: dict, finish=None, usage=None) -> bytes:
+            body = {"id": chunk_id, "object": "chat.completion.chunk", "created": created,
+                    "model": "dfy-companion",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            if usage is not None:
+                body["usage"] = usage
+            return f"data: {json.dumps(body, ensure_ascii=False)}\n\n".encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(event({"role": "assistant", "content": ""}))
+            text = reply or "……"
+            for start in range(0, len(text), 12):  # 回复已整句生成，这里分小段发，界面上一样是边出边显示
+                self.wfile.write(event({"content": text[start:start + 12]}))
+            self.wfile.write(event({}, finish="stop",
+                                   usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}))
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except Exception:
+            pass
+        self.close_connection = True
 
     def log_message(self, fmt, *args) -> None:  # 不往 stderr 刷每条请求
         pass
@@ -225,6 +373,8 @@ class SharedBrainServer:
         self.token = str(server_cfg.get("token") or "")
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self.state_provider = None   # () -> dict：桌宠此刻的状态（给 3D 身体）
+        self.event_handler = None    # (kind) -> bool：3D 身体上的点击
 
     @property
     def running(self) -> bool:
@@ -245,6 +395,8 @@ class SharedBrainServer:
         httpd.brain_token = self.token
         httpd.brain_log = self.log
         httpd.display_name = str(self.config.get("display_name") or self.config.get("pet_name") or "大肥鱼")
+        httpd.pet_state = self.state_provider  # 不加跨域头：3D 身体从 Electron 主进程来取，网页取不到
+        httpd.pet_event = self.event_handler
         self._httpd = httpd
         self._thread = threading.Thread(target=httpd.serve_forever, name="shared-brain", daemon=True)
         self._thread.start()

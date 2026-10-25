@@ -171,6 +171,16 @@ if sys.platform == "win32":
         except Exception:
             return ""
 
+    def cursor_pos() -> tuple[int, int] | None:
+        """鼠标在屏幕上的位置（只读位置，不装全局钩子、不记按键）。"""
+        point = wintypes.POINT()
+        try:
+            if _user32.GetCursorPos(ctypes.byref(point)):
+                return point.x, point.y
+        except Exception:
+            pass
+        return None
+
     def window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
         rect = _RECT()
         try:
@@ -192,6 +202,9 @@ else:  # 非 Windows：没有窗口平台，只有地面
         return ""
 
     def window_rect(hwnd: int):
+        return None
+
+    def cursor_pos():
         return None
 
 

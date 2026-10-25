@@ -527,6 +527,7 @@ class AgentRunner:
             "- 不要读取或复述 .secret_api_key、.env、credentials 这类敏感文件，也不要执行破坏性命令。",
             "- run_powershell 和 write_file 会先弹窗让主人确认；主人没同意就停下来说明。",
             "- 回复用中文口语，20～100 字，最多三小句；不写 Markdown 列表。",
+            *([str(getattr(self.memory, "mood_instruction", ""))] if getattr(self.memory, "mood_instruction", "") else []),
             f"主工作区（相对路径以它为基准）：{root}",
             "今天日期：" + datetime.now().strftime("%Y-%m-%d"),
             "用户称呼：" + str(self.config.get("user_name") or "主人"),
@@ -1134,6 +1135,9 @@ class AgentRunner:
             data = json.loads(raw.decode("utf-8"))
         except Exception:
             raise AgentError("模型接口返回了无法解析的内容") from None
+        appetite = getattr(self.memory, "appetite", None)  # 记饭量：Agent 的每一轮工具调用也是她在吃 token
+        if appetite is not None and isinstance(data, dict):
+            appetite.eat(data.get("usage"), "agent")
         choices = data.get("choices") if isinstance(data, dict) else None
         if not isinstance(choices, list) or not choices:
             raise AgentError("模型接口返回格式不正确（没有 choices）")

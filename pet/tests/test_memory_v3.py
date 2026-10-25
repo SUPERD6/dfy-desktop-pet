@@ -49,6 +49,38 @@ class FactTests(unittest.TestCase):
         self.assertEqual(len(texts), memory.FACTS_LIMIT)
         self.assertIn("主人的生日是三月五号", texts)  # 很旧但重要，没被挤掉
 
+    def test_fact_key_supersedes_but_keeps_old(self):
+        self.store.add_fact("拼团还没开", "event", key="约定.拼团")
+        self.assertTrue(self.store.add_fact("拼团开了，周六一起买", "event", key="约定.拼团"))
+        active = [f["text"] for f in self.store.active_facts]
+        self.assertEqual(active, ["拼团开了，周六一起买"])
+        self.assertTrue(any(f.get("superseded") for f in self.store.facts))  # 旧的还在，只是不再被想起
+
+    def test_key_with_value_is_ignored(self):
+        self.assertEqual(memory.normalize_key("主人.身高170"), "")
+        self.assertEqual(memory.normalize_key(" 主人 。 考试 "), "主人.考试")
+
+    def test_daily_cap_but_important_ones_pass(self):
+        for text in ("主人养了一只橘猫", "主人周末爱爬山", "主人不吃香菜"):
+            self.store.add_fact(text, "note", daily_cap=2)
+        self.assertEqual(len(self.store.facts), 2)
+        self.assertTrue(self.store.add_fact("主人下周三考试", "event", importance=3, daily_cap=2))
+
+    def test_threshold_and_recall_log(self):
+        self.store.add_fact("主人喜欢吃草莓蛋糕", "like")
+        self.store.add_fact("主人在学电气工程", "note")
+        result = self.store.relevant("今天想吃草莓蛋糕", 5)
+        self.assertEqual([r["text"] for r in result], ["主人喜欢吃草莓蛋糕"])
+        log = self.store.last_recall["items"]
+        self.assertTrue(log[0]["chosen"])
+
+    def test_freshness_fades_slower_for_important(self):
+        old = time.time() - 60 * 86400
+        light = {"time": old, "importance": 1}
+        heavy = {"time": old, "importance": 3}
+        self.assertLess(memory.freshness(light), memory.freshness(heavy))
+        self.assertGreater(memory.freshness({"time": old, "importance": 1, "last_used": time.time()}), 0.99)
+
     def test_mark_used_counts_hits(self):
         self.store.add_fact("主人怕冷", "note")
         self.store.mark_used(["主人怕冷"])

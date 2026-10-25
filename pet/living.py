@@ -32,6 +32,9 @@ PEEK_LINES = ("（从屏幕边探头）……被发现了？", "本鲸只是路�
 NAP_LINES = ("呼……本鲸眯一会儿。", "（抱着碗打盹）", "困了困了，就睡五分钟。")
 DANCE_LINES = ("嘿嘿，跳个舞！", "♪ 本鲸今天心情好～")
 CLIMB_LINES = ("爬上来看看风景～", "这里视野好！", "本鲸占领这个窗口了。")
+CHASE_LINES = ("等等本鲸——", "抓到你的鼠标了！", "嘿嘿，跑不掉的～")
+STARE_LINES = ("（被盯着看）……看、看什么看。", "主人的鼠标一直停在本鲸身上……", "唔，要摸头就直接点嘛。")
+STARTLE_LINES = ("哇！吓本鲸一跳。", "嗖的一下，什么东西飞过去了？")
 FG_LINES = ("主人在{label}呀，本鲸不吵你。", "{label}中……本鲸在旁边陪着。")
 FOODS = ("rice", "fish", "cake", "tangyuan")
 JUMP_SOUNDS = ("嘿咻！", "起跳～", "看本鲸的！")
@@ -79,6 +82,12 @@ class Living:
         self._peeks = 0
         self._job = None
         self.foot_pad = 10 + app.pet_h * 0.025
+        self._chase_until = 0.0
+        self._mouse_last = None      # (x, y, t)
+        self._stare_since = 0.0
+        self._stare_said = 0.0
+        self._startle_said = 0.0
+        self._mouse_checked = 0.0
 
     # ---------------------------------------------------------- 开关
     def enabled(self) -> bool:
@@ -163,6 +172,7 @@ class Living:
                 if time.time() >= self.next_decide and self._quiet():
                     self.decide()
                 self._watch_foreground()
+                self._watch_mouse()
             if time.time() - self._last_save > 60:
                 self._last_save = time.time()
                 self.save()
@@ -223,8 +233,13 @@ class Living:
         if abs(fy - p.y) > 0.5:
             fy = p.y
             self.place_foot(fx, fy)
+        if self.mode == "walk" and time.time() < self._chase_until:  # 追鼠标：目标一直跟着鼠标走
+            cur = desktop.cursor_pos()
+            if cur:
+                self.target_x = min(max(cur[0], p.x1 + 30), p.x2 - 30)
+                self.app.animator.set_facing_left(self.target_x < fx)
         if self.mode == "walk" and self.target_x is not None:
-            speed = float(self.cfg.get("walk_speed", 70))
+            speed = float(self.cfg.get("walk_speed", 70)) * (2.2 if time.time() < self._chase_until else 1.0)
             step = speed * dt
             if abs(self.target_x - fx) <= step:
                 fx = self.target_x
@@ -377,6 +392,15 @@ class Living:
         elif activity == "write_diary":
             if self.cfg.get("diary", True):
                 threading.Thread(target=self._diary_worker, daemon=True).start()
+        elif activity == "chase_mouse":
+            cur = desktop.cursor_pos()
+            if cur and p is not None and p.x1 - 50 <= cur[0] <= p.x2 + 50:
+                self._chase_until = time.time() + 6
+                self.walk_to(min(max(cur[0], p.x1 + 30), p.x2 - 30))
+                if random.random() < 0.5:
+                    self._say(CHASE_LINES, 2400)
+            else:
+                activity = "idle"
         elif activity == "call_master":
             self._play("wave", "happy", once=True)
             self._say(CALL_LINES, 4200)
@@ -384,6 +408,41 @@ class Living:
             self._play("idle")
         self.state.mark_done(activity, now)
         self.log(f"桌面生活：{activity}（{self.state.summary()}）")
+
+    # ---------------------------------------------------------- 看鼠标
+    def _watch_mouse(self) -> None:
+        """每 0.2 秒看一眼鼠标：停在她身上久了会害羞，从身边嗖地划过会吓一跳。只读位置。"""
+        now = time.time()
+        if now - self._mouse_checked < 0.2:
+            return
+        self._mouse_checked = now
+        cur = desktop.cursor_pos()
+        if not cur:
+            return
+        app = self.app
+        root = app.root
+        body_left = root.winfo_x() + (app.W - app.pet_w) / 2
+        body_top = root.winfo_y() + app.H - app.pet_h
+        on_body = (body_left <= cur[0] <= body_left + app.pet_w and body_top <= cur[1] <= body_top + app.pet_h)
+        last = self._mouse_last
+        self._mouse_last = (cur[0], cur[1], now)
+        if on_body:
+            if not self._stare_since:
+                self._stare_since = now
+            elif now - self._stare_since > 1.5 and now - self._stare_said > 180 and self._quiet():
+                self._stare_said = now
+                self._play("shy")
+                self._say(STARE_LINES, 2800, voice=False)
+            return
+        self._stare_since = 0.0
+        if last and now - last[2] < 0.5:  # 划得很快、离她很近：吓一跳
+            speed = ((cur[0] - last[0]) ** 2 + (cur[1] - last[1]) ** 2) ** 0.5 / max(0.05, now - last[2])
+            cx, cy = body_left + app.pet_w / 2, body_top + app.pet_h / 2
+            near = ((cur[0] - cx) ** 2 + (cur[1] - cy) ** 2) ** 0.5 < app.pet_w * 0.8
+            if speed > 4000 and near and now - self._startle_said > 120 and self._quiet():
+                self._startle_said = now
+                self._play("surprised")
+                self._say(STARTLE_LINES, 2200, voice=False)
 
     # ---------------------------------------------------------- 看主人在干嘛
     def _watch_foreground(self) -> None:

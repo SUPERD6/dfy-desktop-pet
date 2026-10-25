@@ -43,6 +43,8 @@ CONSOLIDATE_AT = 40         # 对话攒到这么多条，就把最旧的一批�
 CONSOLIDATE_BATCH = 20      # 每次压缩多少条
 EPISODES_LIMIT = 200        # 日记最多留多少条，超了把最旧的几条并成一条
 EPISODE_MERGE = 8
+RECALL_THRESHOLD = 0.6      # 证据门槛：相关度（含鲜活度折扣）低于它的事实不往 prompt 里塞
+FACTS_PER_DAY = 8           # 每天自动记事实的上限（主人明确说「记住」的不算）
 
 # 常见的单字虚词：参与打分容易误命中，单字 token 直接忽略（2-gram 仍保留一部分）
 _STOP_CHARS = set("我你他她它的了是在有就都也还和与跟对把被这那一个不没很太要会能吗呢吧啊哦呀嘛么什怎为何如")
@@ -122,11 +124,34 @@ def similarity(a: set[str], b: set[str]) -> float:
 
 
 def fact_keep_score(fact: dict, now: float) -> float:
-    """淘汰时的保留分：重要度权重最大，其次常被用到，再其次新近（半衰期约 30 天）。"""
+    """淘汰时的保留分：已被取代的最先走；然后看重要度、常被用到、鲜活度。"""
+    if fact.get("superseded"):
+        return -1.0
     importance = _as_float(fact.get("importance"), 1)
     hits = _as_float(fact.get("hits"), 0)
-    age_days = max(0.0, (now - _as_float(fact.get("time"), now)) / 86400.0)
-    return importance * 2.0 + min(hits, 20) ** 0.5 + 2.0 * 0.5 ** (age_days / 30.0)
+    return importance * 2.0 + min(hits, 20) ** 0.5 + 2.0 * freshness(fact, now)
+
+
+# 鲜活度半衰期（天）：越重要的事忘得越慢；被想起来一次就从那时重新算
+HALF_LIFE_DAYS = {1: 14.0, 2: 45.0, 3: 180.0}
+
+
+def freshness(fact: dict, now: float | None = None) -> float:
+    """0..1：离上次被记下/被想起越久越淡。"""
+    now = _now(now)
+    last = max(_as_float(fact.get("time"), 0.0), _as_float(fact.get("last_used"), 0.0))
+    if last <= 0:
+        return 0.5
+    half_life = HALF_LIFE_DAYS.get(int(_as_float(fact.get("importance"), 1)), 14.0)
+    return 0.5 ** (max(0.0, now - last) / 86400.0 / half_life)
+
+
+def normalize_key(key) -> str:
+    """事实键「对象.方面」：去空白、全角点换半角；不像键的（太长、带数字值）当没有。"""
+    key = re.sub(r"\s+", "", str(key or "")).replace("。", ".").replace("．", ".").strip(".")
+    if not key or len(key) > 20 or "." not in key or re.search(r"\d", key):
+        return ""
+    return key
 
 
 def _as_float(value, default: float = 0.0) -> float:
@@ -146,6 +171,7 @@ class MemoryStore:
         # data 是「原始 dict」，Brain 会把它直接暴露给 app.py（兼容旧代码逐键访问）
         self.data: dict = {}
         self.dirty = False
+        self.last_recall: dict = {}
         self._load()
 
     # ---------- 读取与自愈 ----------
@@ -235,9 +261,12 @@ class MemoryStore:
                 "time": ts,
                 "ts": format_time(ts) if ts else "",
             }
-            if isinstance(item, dict):  # v3 字段：命中次数、重要度（旧数据没有就用默认）
+            if isinstance(item, dict):  # v3 字段：命中次数、重要度、事实键、是否被取代、上次被想起（旧数据没有就用默认）
                 fact["hits"] = int(_as_float(item.get("hits"), 0))
                 fact["importance"] = int(min(3, max(1, _as_float(item.get("importance"), 1))))
+                fact["key"] = normalize_key(item.get("key"))
+                fact["superseded"] = bool(item.get("superseded", False))
+                fact["last_used"] = _as_float(item.get("last_used"), 0.0)
             facts.append(fact)
         data["facts"] = facts[-FACTS_LIMIT:]
 
@@ -338,21 +367,37 @@ class MemoryStore:
         return value if isinstance(value, list) else []
 
     # ---------- 写入 ----------
-    def add_fact(self, text: str, kind: str = "note", when: float | None = None, importance: int = 1) -> bool:
+    def add_fact(self, text: str, kind: str = "note", when: float | None = None, importance: int = 1,
+                 key: str = "", daily_cap: int | None = None) -> bool:
         """添加一条事实。
 
-        完全重复 → 不加；和已有事实是同一件事（短句双字词覆盖率 ≥ 0.85）→ 用新说法更新那条（时间刷新、重要度取大），
-        返回 False；满了按「重要度 + 命中次数 + 新近」综合分淘汰最不重要的，而不是最旧的。
+        - 带事实键（「对象.方面」，如 主人.考试）：同键的旧条目标成「已被取代」（不删，能看能恢复），新条目生效。
+          用来处理字面不像但其实是同一件事的更新（「拼团还没开」→「拼团开了」）。思路参考 Yuuyuko-uu/dsh-fish-memory（MIT）。
+        - 不带键：完全重复不加；同一件事换了说法（短句双字词覆盖率 ≥ 0.85）就更新那条。
+        - daily_cap：今天自动记的已达上限就不记（重要度 3 的除外）；主人明确说「记住」时传 None 不受限。
+        - 满了按「重要度 + 命中 + 新近」淘汰，已被取代的先走。
         """
         text = normalize_text(text)[:80]
         if not text:
             return False
         kind = kind if kind in _KIND_LABEL else "note"
         importance = int(min(3, max(1, importance)))
+        key = normalize_key(key)
         ts = _now(when)
         with self._lock:
+            if daily_cap is not None and importance < 3 and self.added_today(ts) >= daily_cap:
+                return False
             new_tokens = tokenize(text)
+            if key:
+                for item in self.facts:
+                    if item.get("key") == key and not item.get("superseded"):
+                        if normalize_text(item.get("text", "")).lower() == text.lower():
+                            return False
+                        item["superseded"] = True
+                        importance = max(importance, int(item.get("importance", 1)))
             for item in self.facts:
+                if item.get("superseded"):
+                    continue
                 old = normalize_text(item.get("text", ""))
                 if old.lower() == text.lower():
                     item["importance"] = max(int(item.get("importance", 1)), importance)
@@ -363,7 +408,8 @@ class MemoryStore:
                     self.dirty = True
                     return False
             self.facts.append({"kind": kind, "text": text, "time": ts, "ts": format_time(ts),
-                               "hits": 0, "importance": importance})
+                               "hits": 0, "importance": importance, "key": key,
+                               "superseded": False, "last_used": 0.0})
             if len(self.facts) > FACTS_LIMIT:
                 now = _now()
                 self.facts.sort(key=lambda f: fact_keep_score(f, now))
@@ -373,12 +419,41 @@ class MemoryStore:
             return True
 
     def mark_used(self, texts) -> None:
-        """这些事实被放进了 prompt：命中次数 +1（常被用到的记得更牢）。"""
+        """这些事实被放进了 prompt：命中 +1、刷新「上次被想起」——被想起的事重新变鲜活。"""
         wanted = {normalize_text(t).lower() for t in texts}
+        now = _now()
         with self._lock:
             for item in self.facts:
                 if normalize_text(item.get("text", "")).lower() in wanted:
                     item["hits"] = int(item.get("hits", 0)) + 1
+                    item["last_used"] = now
+                    self.dirty = True
+
+    @property
+    def active_facts(self) -> list[dict]:
+        return [f for f in self.facts if not f.get("superseded")]
+
+    def added_today(self, now: float | None = None) -> int:
+        start = time.mktime(time.localtime(_now(now))[:3] + (0, 0, 0, 0, 0, -1))
+        return sum(1 for f in self.facts if _as_float(f.get("time")) >= start)
+
+    def forget(self, text: str) -> bool:
+        """主人在记忆面板里删掉一条。"""
+        target = normalize_text(text).lower()
+        with self._lock:
+            before = len(self.facts)
+            self.facts[:] = [f for f in self.facts if normalize_text(f.get("text", "")).lower() != target]
+            if len(self.facts) != before:
+                self.dirty = True
+                return True
+            return False
+
+    def set_importance(self, text: str, importance: int) -> None:
+        target = normalize_text(text).lower()
+        with self._lock:
+            for f in self.facts:
+                if normalize_text(f.get("text", "")).lower() == target:
+                    f["importance"] = int(min(3, max(1, importance)))
                     self.dirty = True
 
     # ---------- 情节记忆：旧对话压成日记 ----------
@@ -475,16 +550,26 @@ class MemoryStore:
             return []
 
         scored: list[tuple[float, float, dict]] = []
-        for fact in self.facts:
-            score = relevance_score(query_tokens, tokenize(fact.get("text", "")))
-            if score > 0:
-                label = _KIND_LABEL.get(fact.get("kind"), "记得")
-                scored.append((score, _as_float(fact.get("time"), 0.0), {
-                    "type": "fact",
-                    "text": fact.get("text", ""),
-                    "detail": f"[{label}] {fact.get('text', '')}",
-                    "time": _as_float(fact.get("time"), 0.0),
-                }))
+        recall: list[dict] = []  # 这次召回的明细（给记忆面板看：挑了谁、没挑谁、为什么）
+        now = _now()
+        for fact in self.active_facts:
+            raw = relevance_score(query_tokens, tokenize(fact.get("text", "")))
+            if raw <= 0:
+                continue
+            fresh = freshness(fact, now)
+            score = raw * (0.5 + 0.5 * fresh)  # 淡了的事要更贴题才想得起来
+            entry = {"text": fact.get("text", ""), "score": round(score, 2), "fresh": round(fresh, 2)}
+            if score < RECALL_THRESHOLD:
+                recall.append({**entry, "chosen": False, "why": "沾边太少，没到门槛"})
+                continue
+            label = _KIND_LABEL.get(fact.get("kind"), "记得")
+            recall.append({**entry, "chosen": True, "why": ""})
+            scored.append((score, _as_float(fact.get("time"), 0.0), {
+                "type": "fact",
+                "text": fact.get("text", ""),
+                "detail": f"[{label}] {fact.get('text', '')}",
+                "time": _as_float(fact.get("time"), 0.0),
+            }))
         # 历史只取用户说过的话（助手的台词容易自己复读自己，噪声大）
         for item in self.history:
             if item.get("role") != "user":
@@ -510,6 +595,12 @@ class MemoryStore:
             result.append(item)
             if len(result) >= limit:
                 break
+        chosen = {item["text"] for item in result}
+        for entry in recall:
+            if entry["chosen"] and entry["text"] not in chosen:
+                entry.update(chosen=False, why=f"够格但没挤进前 {limit} 条")
+        self.last_recall = {"query": query[:60], "time": now,
+                            "items": sorted(recall, key=lambda e: -e["score"])[:12]}
         return result
 
     def relevant_lines(self, query: str, limit: int = RELEVANT_LIMIT) -> list[str]:
