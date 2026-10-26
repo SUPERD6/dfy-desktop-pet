@@ -46,24 +46,25 @@ def main() -> int:
     goal = TOPICS.get(topic, TOPICS["Agent 能力/工具/权限"])
     appetite = Appetite(PET / "appetite.json", daily_snack=int(
         ((cfg.get("life") or {}).get("daily_snack_tokens") or 4000)), log=print)
+    max_steps = max(1, min(80, int(cfg.get("autonomy_max_steps", 24) or 24)))
     prompt = (
-        "你是小鲸鱼，在主人授权下自主优化你自己。你可以上网查资料、读/写本项目代码、2D/3D 素材、"
-        "语音/听写/模型相关文件，可以跑 PowerShell 备份和测试。\n"
+        "你是小鲸鱼，在主人授权下自主优化你自己。你可以上网查资料、读/写本项目代码（包括 app.py 这类大文件）、"
+        "2D/3D 素材、语音/听写/模型相关文件，可以跑 PowerShell 备份和测试。\n"
         f"这一轮只做一个具体、能验证的目标：{goal}\n"
         "流程：\n"
         "1) 读 pet/home/SELF_DIRECTION.md 和最多两个目标文件；不要读整个项目。\n"
         "2) 改前把文件备份到 pet/home/backups/<时间戳>/；第 6 步前必须用 replace_in_file 写一次。\n"
-        "3) 第 10 步前跑相关测试；失败就恢复并如实说明。\n"
+        f"3) 第 {max(10, max_steps - 2)} 步前跑相关测试；失败就恢复并如实说明。\n"
         "4) 不读/改 个人配置、密钥、其他个人数据；不外发、不 git push。\n"
         "5) 最后用中文写 5~10 行：改了什么、怎么验证、下一步。\n"
-        "改代码优先用 replace_in_file，不要整文件重写。"
+        "大文件只改局部：用 search_files 定位、read_file 读局部、replace_in_file 打补丁；不要整文件重写。"
     )
     runner = AgentRunner(PET, cfg, personal=None, overview=None, log=print,
                          confirm=lambda *args: True)
     runner.appetite = appetite
     result = runner.run(prompt, purpose="self_improve",
                         model=(str(cfg.get("autonomy_model") or "").strip() or None),
-                        max_steps=int(cfg.get("autonomy_max_steps", 12) or 12))
+                        max_steps=max_steps)
     reply = str((result or {}).get("reply") or "").strip()
     steps = (result or {}).get("steps") or []
     mutated = any(str(s.get("tool") or "") in ("write_file", "replace_in_file") and s.get("ok")

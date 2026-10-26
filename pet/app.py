@@ -2011,7 +2011,7 @@ class PetApp:
         self.config.setdefault("self_improve_estimate_tokens", 0)
         self.config.setdefault("autonomy_daily_limit", 0)
         self.config.setdefault("autonomy_model", "deepseek-v4-pro")
-        self.config.setdefault("autonomy_max_steps", 12)
+        self.config.setdefault("autonomy_max_steps", 24)
         self.config.setdefault("position_awareness", True)
         self.config.setdefault("ambient_screen_enabled", True)
         self.config.setdefault("ambient_screen_interval", 300)
@@ -2942,6 +2942,7 @@ class PetApp:
         evo_menu.add_command(label="⏱ 设置模型进化频率…", command=self.set_autonomy_interval)
         evo_menu.add_command(label="⏱ 设置小屋优化频率…", command=self.set_home_interval)
         evo_menu.add_command(label="🎯 设置单轮 token 上限…", command=self.set_autonomy_round_limit)
+        evo_menu.add_command(label="🧱 设置单轮最大步数…", command=self.set_autonomy_steps)
         evo_menu.add_command(label="📅 设置每日 token 上限…", command=self.set_autonomy_limit)
         home.add_cascade(label="⚙️  自主进化设置", menu=evo_menu)
         home.add_separator()
@@ -3735,6 +3736,17 @@ class PetApp:
         self.save_config()
         self.bubble.show("单轮上限设为 " + ("不限" if value <= 0 else f"{value} token"), 3600)
 
+    def set_autonomy_steps(self) -> None:
+        value = self._ask_token_int(
+            "单轮最大步数", "一轮自主进化最多用多少步？（1–80；大文件改动可以调高）",
+            int(self.config.get("autonomy_max_steps", 24) or 24))
+        if value is None:
+            return
+        value = max(1, min(80, int(value)))
+        self.config["autonomy_max_steps"] = value
+        self.save_config()
+        self.bubble.show(f"单轮最多 {value} 步；大文件可以用 replace_in_file 局部改。", 3800)
+
     def set_autonomy_interval(self) -> None:
         value = self._ask_token_int("自主进化频率", "每多少分钟自己进化一次？（10–1440）",
                                     int(self.config.get("self_improve_interval_min", 30) or 30))
@@ -4209,14 +4221,15 @@ class PetApp:
                 "流程：\n"
                 "1) 先读 pet/home/SELF_DIRECTION.md 和最多两个目标文件；不要读整个项目，不要先读 AGENTS/STATUS 全文。\n"
                 "2) 改之前把要改的文件备份到 pet/home/backups/ 下一个带时间戳的目录；一轮只做一个可验证的改动。\n"
-                "3) 第 8 步前必须用 replace_in_file 写一次；第 12 步前必须跑相关测试；不要连续只读。\n"
+                "3) 第 8 步前必须用 replace_in_file 写一次；第 20 步前必须跑相关测试；不要连续只读。\n"
                 "4) 如果失败，用备份恢复并如实报告；不要改测试来假装通过。\n"
                 "5) 绝对不要读/改 个人配置、密钥文件、其他个人数据；不要外发、不要 git push、"
                 "不要删除项目以外的东西；不要为了通过测试削弱安全/隐私边界。\n"
                 "6) 本轮不要调用 get_work_overview / read_personal_library / get_dsh_status，这些又慢又和本次改动无关。\n"
                 "7) 最后用中文写 5~10 行：你给自己加了什么能力、改了哪些文件、怎么验证、下一步想做什么。\n"
                 "效率要求：不要一次读整个文件；先用 search_files 定位，再用 read_file 只读相关段。"
-                "改代码优先用 replace_in_file。最多 12 步，本轮目标必须在 10 步内完成。"
+                "改代码优先用 replace_in_file；大文件（比如 app.py）只改局部，不要整文件重写。"
+                "最多 24 步，本轮目标必须在 20 步内完成。"
             )
             from agent import AgentRunner
             runner = AgentRunner(BASE, self.config, personal=None, overview=None,
@@ -4226,7 +4239,7 @@ class PetApp:
             result = runner.run(
                 prompt, purpose="self_improve",
                 model=(str(self.config.get("autonomy_model") or "").strip() or None),
-                max_steps=int(self.config.get("autonomy_max_steps", 12) or 12),
+                max_steps=int(self.config.get("autonomy_max_steps", 24) or 24),
                 on_step=lambda step: log(f"自主进化步骤 {step.get('tool')}：{str(step.get('detail') or '')[:120]}"))
             reply = str((result or {}).get("reply") or "").strip()
             steps = (result or {}).get("steps") or []
