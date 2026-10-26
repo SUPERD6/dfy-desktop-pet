@@ -12,7 +12,8 @@ from interactions import (DRAG_LINES, FOOD_EMOJI, FEED_LINES, INNER_VOICE_LINES,
 class InteractionHelpersTest(unittest.TestCase):
     def test_persona_lines_cover_all_interactions(self):
         self.assertIn("起飞咯——", DRAG_LINES)
-        self.assertEqual(set(FEED_LINES), {"rice", "fish", "cake", "tangyuan", "diamond"})
+        self.assertEqual(set(FEED_LINES), {"rice", "fish", "cake", "tangyuan", "diamond",
+                                           "carrot", "apple", "seaweed", "plant"})
         self.assertTrue(all(FEED_LINES.values()))
         self.assertTrue(INNER_VOICE_LINES)
         self.assertFalse(any("操" in line or "骂" in line or "爹" in line

@@ -7,6 +7,10 @@ FEED_LINES = {
     "cake": ("蛋糕！罪恶但快乐……", "甜到冒泡泡～", "嗝～又圆了一圈……"),
     "tangyuan": ("三色团子！软乎乎～", "糯叽叽，爱了爱了！"),
     "diamond": ("钻石？！这能吃吗……咕咚。真香！", "发财啦！明天开始吃高级鱼粮！"),
+    "carrot": ("胡萝卜？本鲸是鲸鱼，不是兔子……咔嚓。", "脆脆的，对眼睛好。"),
+    "apple": ("苹果！咔嚓一口，甜。", "连苹果核也想啃……"),
+    "seaweed": ("海苔！大海的味道。", "咸咸的，好吃。"),
+    "plant": ("你连盆栽都端来了？！……闻起来还挺香。", "本鲸只吃一口叶子，剩下的留着好看。"),
 }
 
 DRAG_LINES = ("起飞咯——", "晕鱼了晕鱼了……")
@@ -68,34 +72,68 @@ def step_flight(x: float, y: float, vx: float, vy: float, dt: float,
 
 
 # ---------- 投喂道具：手里拿出食物，一口一口咬掉 ----------
-FOOD_EMOJI = {"rice": "🍚", "fish": "🐟", "cake": "🍰", "tangyuan": "🍡", "diamond": "💎"}
+FOOD_EMOJI = {"rice": "🍚", "fish": "🐟", "cake": "🍰", "tangyuan": "🍡", "diamond": "💎",
+              "carrot": "🥕", "apple": "🍎", "seaweed": "🌿", "plant": "🪴"}
 EMOJI_FONT = "C:/Windows/Fonts/seguiemj.ttf"
 # 每一口咬在哪（相对尺寸的圆心 x、y、半径），从右上往左下吃
 BITE_SPOTS = ((0.86, 0.22, 0.24), (0.62, 0.10, 0.22), (0.92, 0.55, 0.24), (0.40, 0.30, 0.26))
 
 
-def render_food(food: str, size: int = 64, bites: int = 0):
-    """彩色 emoji 画成透明 RGBA 图，再按 bites 挖掉几个圆口子（咬痕）。
+def _draw_plant_food(draw, food: str, size: int) -> None:
+    """给植物/水果画简单的矢量小图，比直接塞 emoji 更像她手里的东西。"""
+    s = size
+    if food == "carrot":
+        draw.polygon([(s * .44, s * .18), (s * .62, s * .20), (s * .57, s * .82),
+                      (s * .43, s * .82)], fill=(240, 130, 45, 255), outline=(170, 80, 20, 255))
+        for x, y in ((.40, .12), (.50, .06), (.60, .12)):
+            draw.ellipse((s * x, s * y, s * (x + .13), s * (y + .16)), fill=(70, 155, 65, 255))
+    elif food == "apple":
+        draw.ellipse((s * .18, s * .24, s * .82, s * .88), fill=(215, 55, 55, 255),
+                     outline=(145, 30, 30, 255), width=max(1, s // 32))
+        draw.rectangle((s * .48, s * .08, s * .53, s * .25), fill=(110, 75, 35, 255))
+        draw.ellipse((s * .54, s * .10, s * .74, s * .20), fill=(70, 155, 65, 255))
+    elif food == "seaweed":
+        # 先铺一张宽海苔，再叠绿色叶脉；这样咬痕和手中道具都清楚
+        draw.rounded_rectangle((s * .18, s * .20, s * .85, s * .82),
+                               radius=max(2, s // 12), fill=(32, 125, 72, 255))
+        for dx, color in ((0, (45, 155, 90, 255)), (s * .16, (25, 105, 62, 255)),
+                          (s * .32, (60, 170, 100, 255))):
+            draw.polygon([(s * .24 + dx, s * .76), (s * .22 + dx, s * .38),
+                          (s * .32 + dx, s * .26), (s * .38 + dx, s * .40),
+                          (s * .34 + dx, s * .76)], fill=color)
+    elif food == "plant":
+        draw.polygon([(s * .30, s * .62), (s * .70, s * .62), (s * .63, s * .9), (s * .37, s * .9)],
+                     fill=(190, 110, 70, 255), outline=(120, 65, 35, 255))
+        for x, y, w, h in ((.38, .22, .28, .30), (.22, .34, .24, .24), (.54, .34, .24, .24),
+                           (.44, .10, .18, .22)):
+            draw.ellipse((s * x, s * y, s * (x + w), s * (y + h)), fill=(65, 155, 75, 255))
+    else:
+        draw.ellipse((s * .2, s * .2, s * .8, s * .8), fill=(240, 200, 100, 255))
 
-    字体不可用时退回一个画出来的饭团，保证总有东西可拿。
-    """
+
+def render_food(food: str, size: int = 64, bites: int = 0):
+    """透明 RGBA 食物图；植物/水果用简单矢量画，其他用 emoji，再挖咬痕。"""
     from PIL import Image, ImageDraw, ImageFont
 
     canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    emoji = FOOD_EMOJI.get(food, FOOD_EMOJI["rice"])
     drawn = False
-    try:
-        font = ImageFont.truetype(EMOJI_FONT, 109)  # Segoe UI Emoji 的位图档位，缩放后最清楚
-        glyph = Image.new("RGBA", (136, 128), (0, 0, 0, 0))
-        ImageDraw.Draw(glyph).text((0, 0), emoji, font=font, embedded_color=True)
-        box = glyph.getbbox()
-        if box:
-            glyph = glyph.crop(box)
-            glyph.thumbnail((size, size), Image.LANCZOS)
-            canvas.paste(glyph, ((size - glyph.width) // 2, (size - glyph.height) // 2), glyph)
-            drawn = True
-    except Exception:
-        drawn = False
+    if food in ("carrot", "apple", "seaweed", "plant"):
+        _draw_plant_food(ImageDraw.Draw(canvas), food, size)
+        drawn = True
+    emoji = FOOD_EMOJI.get(food, FOOD_EMOJI["rice"])
+    if not drawn:
+        try:
+            font = ImageFont.truetype(EMOJI_FONT, 109)  # Segoe UI Emoji 的位图档位，缩放后最清楚
+            glyph = Image.new("RGBA", (136, 128), (0, 0, 0, 0))
+            ImageDraw.Draw(glyph).text((0, 0), emoji, font=font, embedded_color=True)
+            box = glyph.getbbox()
+            if box:
+                glyph = glyph.crop(box)
+                glyph.thumbnail((size, size), Image.LANCZOS)
+                canvas.paste(glyph, ((size - glyph.width) // 2, (size - glyph.height) // 2), glyph)
+                drawn = True
+        except Exception:
+            drawn = False
     if not drawn:
         draw = ImageDraw.Draw(canvas)
         draw.ellipse((size * 0.12, size * 0.18, size * 0.88, size * 0.9), fill=(250, 250, 245, 255),

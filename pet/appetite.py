@@ -18,7 +18,8 @@ from pathlib import Path
 # 她自己发起的、要从零食额度里扣的用途
 AUTONOMOUS = {"remark", "diary", "proactive", "memory", "self_improve"}
 # 投喂 = 给零食额度（token）
-FOOD_TOKENS = {"rice": 1500, "fish": 800, "cake": 2000, "tangyuan": 1000, "diamond": 8000}
+FOOD_TOKENS = {"rice": 1500, "fish": 800, "cake": 2000, "tangyuan": 1000, "diamond": 8000,
+               "carrot": 1200, "apple": 900, "seaweed": 700, "plant": 1800}
 DAILY_SNACK = 4000
 
 
@@ -120,14 +121,39 @@ class Appetite:
     def feed(self, food: str) -> int:
         """主人投喂 = 给零食额度。返回加了多少 token。"""
         grant = FOOD_TOKENS.get(food, 1000)
+        return self.add_allowance(grant)
+
+    def add_allowance(self, tokens: int) -> int:
+        """给一份明确数量的零食 token（自定义投喂/手动加额度）。"""
+        tokens = max(0, min(10_000_000, int(tokens or 0)))
         self.rollover()
         with self._lock:
-            self.data["allowance"] = int(self.data.get("allowance", 0)) + grant
-            self.data["fed_total"] = int(self.data.get("fed_total", 0)) + grant
+            self.data["allowance"] = int(self.data.get("allowance", 0)) + tokens
+            self.data["fed_total"] = int(self.data.get("fed_total", 0)) + tokens
             self.save()
-        return grant
+        return tokens
+
+    def set_allowance(self, tokens: int) -> int:
+        """把今天剩余可用额度直接设成 tokens。"""
+        tokens = max(0, min(10_000_000, int(tokens or 0)))
+        self.rollover()
+        with self._lock:
+            self.data["allowance"] = tokens
+            self.save()
+        return tokens
+
+    def set_daily_snack(self, tokens: int) -> int:
+        """设置以后每天自动补到多少 token。"""
+        tokens = max(0, min(10_000_000, int(tokens or 0)))
+        self.daily_snack = tokens
+        self.rollover()
+        with self._lock:
+            self.save()
+        return tokens
 
     # ---------- 看 ----------
+    def eaten_by(self, purpose: str) -> int:
+        return int((self.data.get("eaten") or {}).get(purpose, 0))
     def eaten_today(self) -> int:
         return sum(int(v) for v in (self.data.get("eaten") or {}).values())
 

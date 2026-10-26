@@ -418,8 +418,9 @@ class AgentRunner:
         self.memory = None
 
     # ------------------------------------------------------------------ 对外：主循环
-    def run(self, user_text: str, on_step=None) -> dict:
+    def run(self, user_text: str, on_step=None, purpose: str = "agent") -> dict:
         """跑一轮「用户说一句 → 可能调几次工具 → 她回一句」。永不抛异常。"""
+        self._usage_purpose = str(purpose or "agent")
         steps: list[dict] = []
         try:
             text = str(user_text or "").strip()
@@ -1235,7 +1236,7 @@ class AgentRunner:
             raise AgentError("模型接口返回了无法解析的内容") from None
         appetite = getattr(self.memory, "appetite", None)  # 记饭量：Agent 的每一轮工具调用也是她在吃 token
         if appetite is not None and isinstance(data, dict):
-            appetite.eat(data.get("usage"), "agent")
+            appetite.eat(data.get("usage"), getattr(self, "_usage_purpose", "agent"))
         choices = data.get("choices") if isinstance(data, dict) else None
         if not isinstance(choices, list) or not choices:
             raise AgentError("模型接口返回格式不正确（没有 choices）")

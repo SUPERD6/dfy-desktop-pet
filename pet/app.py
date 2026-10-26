@@ -2006,6 +2006,7 @@ class PetApp:
         self.config.setdefault("self_improve_autonomous", True)
         self.config.setdefault("self_improve_interval_min", 30)
         self.config.setdefault("self_improve_estimate_tokens", 5000)
+        self.config.setdefault("autonomy_daily_limit", 20000)
         self.config.setdefault("ambient_screen_enabled", True)
         self.config.setdefault("ambient_screen_interval", 300)
         self.config.setdefault("roam_enabled", False)
@@ -2949,7 +2950,9 @@ class PetApp:
         feed_menu = tk.Menu(fun, tearoff=0, font=("Microsoft YaHei", 9))
         for key, label in (("rice", "🍚 白饭"), ("fish", "🐟 小鱼干"),
                            ("cake", "🍰 蛋糕"), ("tangyuan", "🍡 团子"),
-                           ("diamond", "💎 钻石")):
+                           ("diamond", "💎 钻石"), ("carrot", "🥕 胡萝卜"),
+                           ("apple", "🍎 苹果"), ("seaweed", "🌿 海苔"),
+                           ("plant", "🪴 小盆栽")):
             feed_menu.add_command(label=label, command=lambda food=key: self.feed(food))
         fun.add_cascade(label="🍽  直接投喂", menu=feed_menu)
         fun.add_command(label="🖼  甩个表情包",
@@ -3008,6 +3011,14 @@ class PetApp:
         # ---------- 设置与系统 ----------
         system = sub("⚙️  设置与系统")
         system.add_command(label="🍚  看看饭碗（余额/今日 token）", command=self.check_balance)
+        budget_menu = tk.Menu(system, tearoff=0, font=("Microsoft YaHei", 9))
+        budget_menu.add_command(label="查看 token 用量/剩余", command=self.show_token_budget)
+        budget_menu.add_command(label="设置今日可用 token 额度…", command=self.set_today_allowance)
+        budget_menu.add_command(label="设置每日发放额度…", command=self.set_daily_snack)
+        budget_menu.add_command(label="设置自主进化每日上限…", command=self.set_autonomy_limit)
+        budget_menu.add_separator()
+        budget_menu.add_command(label="✏️ 自定义投喂 token…", command=self.feed_custom_tokens)
+        system.add_cascade(label="🍚  token 额度与用量", menu=budget_menu)
         self.dsh_var = tk.BooleanVar(value=bool((self.config.get("dsh_status") or {}).get("enabled", True)))
         system.add_checkbutton(label="🌊  跟随 DSH 工作状态", variable=self.dsh_var,
                                command=self.toggle_dsh_follow)
@@ -3376,21 +3387,26 @@ class PetApp:
             pass
         win.configure(bg="#eef4ff")
         px, py = self.root.winfo_x(), self.root.winfo_y()
-        win.geometry(f"300x92+{px + 70}+{max(20, py - 100)}")
+        win.geometry(f"440x146+{px + 40}+{max(20, py - 150)}")
         outer = tk.Frame(win, bg="#ffffff", highlightbackground="#a9c3f2", highlightthickness=2)
         outer.pack(fill="both", expand=True, padx=3, pady=3)
-        tk.Label(outer, text="喂她点什么？", bg="#ffffff", fg="#24468f",
+        tk.Label(outer, text="喂她点什么？（也可以直接给 token）", bg="#ffffff", fg="#24468f",
                  font=("Microsoft YaHei", 9, "bold")).pack(anchor="w", padx=8, pady=(5, 2))
-        row = tk.Frame(outer, bg="#ffffff")
-        row.pack(fill="x", padx=6, pady=(0, 5))
         foods = (("rice", "🍚 白饭"), ("fish", "🐟 小鱼干"), ("cake", "🍰 蛋糕"),
-                 ("tangyuan", "🍡 团子"), ("diamond", "💎 钻石"))
-        for key, label in foods:
-            tk.Button(row, text=label, command=lambda f=key: (self.feed(f), win.destroy()),
-                      bg="#f5f8ff", fg="#2a3550", relief="flat", cursor="hand2",
-                      font=("Microsoft YaHei", 8), padx=5).pack(side="left", padx=2)
+                 ("tangyuan", "🍡 团子"), ("diamond", "💎 钻石"), ("carrot", "🥕 胡萝卜"),
+                 ("apple", "🍎 苹果"), ("seaweed", "🌿 海苔"), ("plant", "🪴 小盆栽"))
+        for start in (0, 5):
+            row = tk.Frame(outer, bg="#ffffff")
+            row.pack(fill="x", padx=6, pady=(0, 3))
+            for key, label in foods[start:start + 5]:
+                tk.Button(row, text=label, command=lambda f=key: (self.feed(f), win.destroy()),
+                          bg="#f5f8ff", fg="#2a3550", relief="flat", cursor="hand2",
+                          font=("Microsoft YaHei", 8), padx=4).pack(side="left", padx=2)
+        tk.Button(outer, text="✏️ 自定义 token…", command=lambda: (win.destroy(), self.feed_custom_tokens()),
+                  bg="#eef7e6", fg="#3f6b2a", relief="flat", cursor="hand2",
+                  font=("Microsoft YaHei", 8), padx=6).pack(anchor="w", padx=8)
         win.bind("<Escape>", lambda e: win.destroy())
-        win.after(12000, lambda: win.destroy() if win.winfo_exists() else None)
+        win.after(15000, lambda: win.destroy() if win.winfo_exists() else None)
 
     def feed(self, food: str = "rice") -> None:
         self._touch()
@@ -3586,6 +3602,64 @@ class PetApp:
     def check_balance(self) -> None:
         self.bubble.show("本鲸看看 token 碗里还剩多少…", 2500)
         threading.Thread(target=self._balance_worker, daemon=True).start()
+
+    def show_token_budget(self) -> None:
+        daily = int(self.config.get("life", {}).get("daily_snack_tokens") or self.appetite.daily_snack)
+        limit = int(self.config.get("autonomy_daily_limit", 20000) or 0)
+        spent = self.appetite.eaten_by("self_improve")
+        cap_text = "不限" if limit <= 0 else f"{limit}"
+        text = (f"{self.appetite.summary()}\n"
+                f"每日发放：{daily} token；自主进化今日已用：{spent} / {cap_text}；"
+                f"单轮预估上限：{self.config.get('self_improve_estimate_tokens', 5000)}")
+        self.bubble.show(text, 8000)
+
+    def _ask_token_int(self, title: str, prompt: str, current: int) -> int | None:
+        from tkinter import simpledialog
+        value = simpledialog.askinteger(title, prompt, parent=self.root,
+                                        initialvalue=int(current), minvalue=0,
+                                        maxvalue=10_000_000)
+        return None if value is None else int(value)
+
+    def set_today_allowance(self) -> None:
+        value = self._ask_token_int("今日 token 额度", "今天她还能自己用多少 token？",
+                                    self.appetite.allowance)
+        if value is None:
+            return
+        self.appetite.set_allowance(value)
+        self.bubble.show(f"今天的自主额度设为 {value} token。", 3600)
+
+    def set_daily_snack(self) -> None:
+        life = self.config.setdefault("life", {})
+        if not isinstance(life, dict):
+            life = self.config["life"] = {}
+        value = self._ask_token_int(
+            "每日发放额度", "以后每天自动补到多少 token？（下次跨天生效）",
+            int(life.get("daily_snack_tokens") or self.appetite.daily_snack))
+        if value is None:
+            return
+        life["daily_snack_tokens"] = value
+        self.appetite.set_daily_snack(value)
+        self.save_config()
+        self.bubble.show(f"以后每天补到 {value} token。", 3800)
+
+    def set_autonomy_limit(self) -> None:
+        value = self._ask_token_int(
+            "自主进化每日上限", "自主进化每天最多花多少 token？（0 = 不限）",
+            int(self.config.get("autonomy_daily_limit", 20000) or 0))
+        if value is None:
+            return
+        self.config["autonomy_daily_limit"] = value
+        self.save_config()
+        self.bubble.show("自主进化每日上限设为 " + ("不限" if value <= 0 else f"{value} token"), 3600)
+
+    def feed_custom_tokens(self) -> None:
+        value = self._ask_token_int("自定义投喂", "直接喂她多少 token？", 3000)
+        if value is None:
+            return
+        if value <= 0:
+            return
+        granted = self.appetite.add_allowance(value)
+        self.bubble.show(f"喂了 {granted} token；现在还剩 {self.appetite.allowance}。", 4200)
 
     def _balance_worker(self) -> None:
         try:
@@ -3979,6 +4053,12 @@ class PetApp:
             self.root.after(0, lambda: self.bubble.show(
                 "本鲸想自己优化，但今天的零食 token 不够了；喂一口再继续。", 4800))
             return
+        limit = int(self.config.get("autonomy_daily_limit", 20000) or 0)
+        spent = self.appetite.eaten_by("self_improve") if hasattr(self, "appetite") else 0
+        if limit > 0 and spent + estimate > limit:
+            self.root.after(0, lambda: self.bubble.show(
+                f"自主进化今天已经用了 {spent} token，接近上限 {limit}；明天再继续。", 5200))
+            return
         self._autonomy_busy = True
         try:
             prompt = (
@@ -4000,7 +4080,7 @@ class PetApp:
                 "不要删除项目以外的东西；不要为了通过测试削弱安全/隐私边界。\n"
                 "6) 最后用中文写 5~10 行：你给自己加了什么能力、改了哪些文件、怎么验证、下一步想做什么。"
             )
-            result = self.agent.run(prompt)
+            result = self.agent.run(prompt, purpose="self_improve")
             reply = str((result or {}).get("reply") or "").strip()
             steps = (result or {}).get("steps") or []
             if reply:

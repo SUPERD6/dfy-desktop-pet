@@ -40,6 +40,22 @@ class AppetiteTest(unittest.TestCase):
         self.assertEqual(a.feed("diamond"), 8000)
         self.assertEqual(a.allowance, 8000)
 
+    def test_token_budget_can_be_set_and_custom_fed(self):
+        a = fresh(daily=1000)
+        self.assertEqual(a.set_allowance(2500), 2500)
+        self.assertEqual(a.allowance, 2500)
+        self.assertEqual(a.add_allowance(500), 500)
+        self.assertEqual(a.allowance, 3000)
+        self.assertEqual(a.set_daily_snack(6000), 6000)
+        a.eat({"total_tokens": 700}, "self_improve")
+        self.assertEqual(a.eaten_by("self_improve"), 700)
+
+    def test_new_foods_have_distinct_token_values(self):
+        a = fresh(daily=0)
+        for food in ("carrot", "apple", "seaweed", "plant"):
+            self.assertGreater(a.feed(food), 0)
+        self.assertGreater(a.allowance, 0)
+
     def test_listener_and_persistence(self):
         a = fresh()
         got = []
