@@ -436,10 +436,11 @@ class AgentRunner:
 
     # ------------------------------------------------------------------ 对外：主循环
     def run(self, user_text: str, on_step=None, purpose: str = "agent",
-            model: str | None = None) -> dict:
+            model: str | None = None, max_steps: int | None = None) -> dict:
         """跑一轮「用户说一句 → 可能调几次工具 → 她回一句」。永不抛异常。"""
         self._usage_purpose = str(purpose or "agent")
         self._model_override = str(model or "").strip()
+        self._max_steps_override = int(max_steps or 0)
         steps: list[dict] = []
         try:
             text = str(user_text or "").strip()
@@ -1237,13 +1238,16 @@ class AgentRunner:
         agent_cfg = _as_dict(self.config.get("agent"))
         override = str(getattr(self, "_model_override", "") or "").strip()
         model = override or str(llm.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+        step_cap = _clamp_int(agent_cfg.get("max_steps"), MAX_STEPS, 1, MAX_STEPS)
+        if int(getattr(self, "_max_steps_override", 0) or 0) > 0:
+            step_cap = min(step_cap, int(self._max_steps_override))
         return {
             "base_url": _normalize_base_url(llm.get("base_url")),
             "model": model,
             "timeout_s": _clamp_float(llm.get("timeout_s"), 30.0, 0.1, 300.0),
             "max_tokens": _clamp_int(agent_cfg.get("max_tokens"), 800, 64, 4096),
             "temperature": _clamp_float(agent_cfg.get("temperature"), 0.3, 0.0, 2.0),
-            "max_steps": _clamp_int(agent_cfg.get("max_steps"), MAX_STEPS, 1, MAX_STEPS),
+            "max_steps": step_cap,
         }
 
     def _resolve_api_key(self) -> tuple[str, str]:
@@ -1314,7 +1318,7 @@ class AgentRunner:
             data = json.loads(raw.decode("utf-8"))
         except Exception:
             raise AgentError("模型接口返回了无法解析的内容") from None
-        appetite = getattr(self.memory, "appetite", None)  # 记饭量：Agent 的每一轮工具调用也是她在吃 token
+        appetite = getattr(self.memory, "appetite", None) or getattr(self, "appetite", None)
         if appetite is not None and isinstance(data, dict):
             appetite.eat(data.get("usage"), getattr(self, "_usage_purpose", "agent"))
         choices = data.get("choices") if isinstance(data, dict) else None

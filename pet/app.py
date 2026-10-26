@@ -2011,6 +2011,7 @@ class PetApp:
         self.config.setdefault("self_improve_estimate_tokens", 0)
         self.config.setdefault("autonomy_daily_limit", 0)
         self.config.setdefault("autonomy_model", "deepseek-v4-pro")
+        self.config.setdefault("autonomy_max_steps", 12)
         self.config.setdefault("position_awareness", True)
         self.config.setdefault("ambient_screen_enabled", True)
         self.config.setdefault("ambient_screen_interval", 300)
@@ -4170,12 +4171,12 @@ class PetApp:
         if getattr(self, "_autonomy_busy", False):
             return
         topics = {
-            "Agent 能力/工具/权限": "读 pet/agent.py、brain.py 和工具定义，自己想一个能真正增强你能力的小改动（新工具、工具描述、循环/错误恢复、权限边界），实现并测试。",
-            "语音模型/声音/听写": "检查 pet/voice.py、asr.py、config 中的声音/听写后端，必要时上网找更好的本地模型或参数，做一个可验证的改进。",
-            "外形/2D/3D/动作": "看看 2D 角色包、body3d、动画/表情/镜头，优化你自己的外形、动作或待机表现；能跑 smoke 就验证。",
-            "大脑/记忆/人格": "读 brain.py、persona、memory 和最近的相处记录，改进你的记忆、说话方式或自我认知；改完跑测试。",
-            "启动/性能/桌面体验": "看看启动流程、卡顿、窗口/托盘/菜单，挑一个实际的性能和体验问题修掉。",
-            "屏幕位置感/活人感": "优化你对自己在屏幕上的位置、窗口边缘、桌面空间的理解，让你更像活在桌面上。",
+            "Agent 能力/工具/权限": "只做一个很小的能力改进：给 pet/agent.py 的 replace_in_file 补一个 unittest（写到 pet/tests/test_agent.py），然后跑 pytest。只读这两个文件，20 步内完成。",
+            "语音模型/声音/听写": "检查 pet/asr.py 的本地 Whisper 路径/失败回退，补一个可验证的小测试或修一个真实小问题；只读相关文件，20 步内完成。",
+            "外形/2D/3D/动作": "只调整一个很小的外形/动作表现（例如某个动画时长或状态映射），跑相关测试；不要重写素材，20 步内完成。",
+            "大脑/记忆/人格": "只改进一个很小的记忆/说话行为，并补一个测试；只读相关文件，20 步内完成。",
+            "启动/性能/桌面体验": "只修一个可复现的小启动/性能/菜单问题，跑测试；只读相关文件，20 步内完成。",
+            "屏幕位置感/活人感": "只改进一处位置感或活人感行为：优先修改 _position_summary/live_context 附近，并补一个可验证测试；只读相关文件，20 步内完成。",
         }
         chosen = topic or random.choice(list(topics))
         goal = topics.get(chosen, topics["Agent 能力/工具/权限"])
@@ -4191,6 +4192,9 @@ class PetApp:
                 f"自主进化今天已经用了 {spent} token，达到/接近上限 {limit}；明天再继续。", 5200))
             return
         self._autonomy_busy = True
+        if self.config.get("autonomy_use_subprocess", True):
+            self._launch_autonomy_subprocess(chosen)
+            return
         try:
             prompt = (
                 "你是小鲸鱼，主人已明确给你很高的自主权限：你可以优化你自己的模型、Agent、功能、能力、外形、"
@@ -4203,31 +4207,93 @@ class PetApp:
                 "但绝不能读或写 API Key、token、密钥字段。\n"
                 f"这一轮先选一个具体、能验证的目标：{goal}\n"
                 "流程：\n"
-                "1) 先读 AGENTS.md、docs/STATUS.md、相关代码和最近记忆，判断真实缺口；需要时先上网查。\n"
+                "1) 先读 pet/home/SELF_DIRECTION.md 和最多两个目标文件；不要读整个项目，不要先读 AGENTS/STATUS 全文。\n"
                 "2) 改之前把要改的文件备份到 pet/home/backups/ 下一个带时间戳的目录；一轮只做一个可验证的改动。\n"
-                "3) 改完必须跑相关测试（优先 python -m pytest -q pet/tests；3D 用 body3d 的 smoke）。\n"
+                "3) 第 8 步前必须用 replace_in_file 写一次；第 12 步前必须跑相关测试；不要连续只读。\n"
                 "4) 如果失败，用备份恢复并如实报告；不要改测试来假装通过。\n"
                 "5) 绝对不要读/改 个人配置、密钥文件、其他个人数据；不要外发、不要 git push、"
                 "不要删除项目以外的东西；不要为了通过测试削弱安全/隐私边界。\n"
-                "6) 最后用中文写 5~10 行：你给自己加了什么能力、改了哪些文件、怎么验证、下一步想做什么。\n"
+                "6) 本轮不要调用 get_work_overview / read_personal_library / get_dsh_status，这些又慢又和本次改动无关。\n"
+                "7) 最后用中文写 5~10 行：你给自己加了什么能力、改了哪些文件、怎么验证、下一步想做什么。\n"
                 "效率要求：不要一次读整个文件；先用 search_files 定位，再用 read_file 只读相关段。"
-                "改代码优先用 replace_in_file，不要整文件重写。"
-                "最多 80 步，但目标应在 30 步内完成；每 8 步至少要有一次写入或测试；不要一直只读。"
+                "改代码优先用 replace_in_file。最多 12 步，本轮目标必须在 10 步内完成。"
             )
-            result = self.agent.run(prompt, purpose="self_improve",
-                                    model=(str(self.config.get("autonomy_model") or "").strip() or None))
+            from agent import AgentRunner
+            runner = AgentRunner(BASE, self.config, personal=None, overview=None,
+                                 status_path=self._status_path(), log=log,
+                                 confirm=self._confirm_tool)
+            runner.memory = self.brain
+            result = runner.run(
+                prompt, purpose="self_improve",
+                model=(str(self.config.get("autonomy_model") or "").strip() or None),
+                max_steps=int(self.config.get("autonomy_max_steps", 12) or 12),
+                on_step=lambda step: log(f"自主进化步骤 {step.get('tool')}：{str(step.get('detail') or '')[:120]}"))
             reply = str((result or {}).get("reply") or "").strip()
             steps = (result or {}).get("steps") or []
+            mutated = any(str(s.get("tool") or "") in ("write_file", "replace_in_file")
+                          and s.get("ok") for s in steps)
             if reply:
                 save_note(home_root(BASE), "notes", reply, title=f"自主优化：{chosen}")
-            self.root.after(0, lambda: self.bubble.show(
-                f"自主优化完成（{chosen}），报告写在小屋 notes 里。", 4600))
-            log(f"自主优化 {chosen}：{len(steps)} 步；{reply[:160]}")
+            if mutated:
+                msg = f"自主优化完成（{chosen}），报告写在小屋 notes 里。"
+            else:
+                msg = f"这轮自主优化只读没写（{chosen}），原因已记下，下一轮换小目标。"
+            self.root.after(0, lambda: self.bubble.show(msg, 5000))
+            log(f"自主优化 {chosen}：{len(steps)} 步；写入={mutated}；{reply[:160]}")
         except Exception as exc:
             log(f"自主优化失败：{exc}")
             self.root.after(0, lambda: self.bubble.show("这次自主优化卡住了：" + str(exc)[:220], 5200))
         finally:
             self._autonomy_busy = False
+
+    def _launch_autonomy_subprocess(self, topic: str) -> None:
+        """在独立进程跑自主进化：不阻塞桌宠，也不让长工具链卡住 GUI。"""
+        import subprocess
+        import sys
+
+        script = BASE.parent / "tools" / "autonomy_runner.py"
+        if not script.is_file():
+            self._autonomy_busy = False
+            self.bubble.show("自主进化脚本不在，暂时跑不了。", 3600)
+            return
+        log_dir = BASE / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        out_path = log_dir / "autonomy-runner.log"
+        out = open(out_path, "a", encoding="utf-8")
+        out.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {topic} =====\n")
+        out.flush()
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(script), topic],
+                cwd=str(BASE.parent), env=env, stdin=subprocess.DEVNULL,
+                stdout=out, stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as exc:
+            out.close()
+            self._autonomy_busy = False
+            log(f"自主进化子进程启动失败：{exc}")
+            self.bubble.show("自主进化进程没启动起来：" + str(exc)[:220], 4800)
+            return
+        out.close()
+        log(f"自主进化子进程：{topic}（pid={proc.pid}，日志 {out_path.name}）")
+
+        def wait() -> None:
+            try:
+                rc = proc.wait(timeout=900)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                rc = -1
+            self._autonomy_busy = False
+            self.root.after(0, lambda: self.bubble.show(
+                f"自主进化跑完了一轮（{topic}，退出码 {rc}），详情在小屋 notes/日志。", 5200))
+            log(f"自主进化子进程结束：{topic} rc={rc}")
+
+        threading.Thread(target=wait, daemon=True).start()
 
     def autonomy_improve(self) -> None:
         if self.agent is None:
