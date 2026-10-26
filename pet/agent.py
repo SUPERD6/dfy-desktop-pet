@@ -418,9 +418,11 @@ class AgentRunner:
         self.memory = None
 
     # ------------------------------------------------------------------ 对外：主循环
-    def run(self, user_text: str, on_step=None, purpose: str = "agent") -> dict:
+    def run(self, user_text: str, on_step=None, purpose: str = "agent",
+            model: str | None = None) -> dict:
         """跑一轮「用户说一句 → 可能调几次工具 → 她回一句」。永不抛异常。"""
         self._usage_purpose = str(purpose or "agent")
+        self._model_override = str(model or "").strip()
         steps: list[dict] = []
         try:
             text = str(user_text or "").strip()
@@ -1157,9 +1159,11 @@ class AgentRunner:
     def _llm_options(self) -> dict:
         llm = _as_dict(self.config.get("llm"))
         agent_cfg = _as_dict(self.config.get("agent"))
+        override = str(getattr(self, "_model_override", "") or "").strip()
+        model = override or str(llm.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
         return {
             "base_url": _normalize_base_url(llm.get("base_url")),
-            "model": str(llm.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+            "model": model,
             "timeout_s": _clamp_float(llm.get("timeout_s"), 30.0, 0.1, 300.0),
             "max_tokens": _clamp_int(agent_cfg.get("max_tokens"), 800, 64, 4096),
             "temperature": _clamp_float(agent_cfg.get("temperature"), 0.3, 0.0, 2.0),

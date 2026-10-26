@@ -2005,8 +2005,9 @@ class PetApp:
         self.config.setdefault("self_improve_enabled", True)
         self.config.setdefault("self_improve_autonomous", True)
         self.config.setdefault("self_improve_interval_min", 30)
-        self.config.setdefault("self_improve_estimate_tokens", 5000)
-        self.config.setdefault("autonomy_daily_limit", 20000)
+        self.config.setdefault("self_improve_estimate_tokens", 0)
+        self.config.setdefault("autonomy_daily_limit", 0)
+        self.config.setdefault("autonomy_model", "deepseek-v4-pro")
         self.config.setdefault("ambient_screen_enabled", True)
         self.config.setdefault("ambient_screen_interval", 300)
         self.config.setdefault("roam_enabled", False)
@@ -2881,8 +2882,27 @@ class PetApp:
         home.add_command(label="🧠  让她整理小屋/自省", command=self.reflect_home)
         home.add_command(label="🧬  自主进化（模型/Agent/能力/外形）…", command=self.autonomy_improve)
         self.self_auto_var = tk.BooleanVar(value=bool(self.config.get("self_improve_autonomous")))
-        home.add_checkbutton(label="⏱  每 30 分钟自主优化一次", variable=self.self_auto_var,
+        home.add_checkbutton(label="⏱  自动自主进化", variable=self.self_auto_var,
                              command=self.toggle_self_autonomy)
+        evo_menu = tk.Menu(home, tearoff=0, font=("Microsoft YaHei", 9))
+        self.autonomy_model_var = tk.StringVar(
+            value=str(self.config.get("autonomy_model") or "deepseek-v4-pro"))
+        model_menu = tk.Menu(evo_menu, tearoff=0, font=("Microsoft YaHei", 9))
+        model_menu.add_radiobutton(label="MAX / deepseek-v4-pro（最强）",
+                                   variable=self.autonomy_model_var, value="deepseek-v4-pro",
+                                   command=lambda: self.set_autonomy_model("deepseek-v4-pro"))
+        model_menu.add_radiobutton(label="跟聊天同一个模型",
+                                   variable=self.autonomy_model_var, value="",
+                                   command=lambda: self.set_autonomy_model(""))
+        model_menu.add_radiobutton(label="deepseek-flash（快/省）",
+                                   variable=self.autonomy_model_var, value="deepseek-flash",
+                                   command=lambda: self.set_autonomy_model("deepseek-flash"))
+        evo_menu.add_cascade(label="🧠 自主进化用的模型", menu=model_menu)
+        evo_menu.add_separator()
+        evo_menu.add_command(label="⏱ 设置自主进化频率…", command=self.set_autonomy_interval)
+        evo_menu.add_command(label="🎯 设置单轮 token 上限…", command=self.set_autonomy_round_limit)
+        evo_menu.add_command(label="📅 设置每日 token 上限…", command=self.set_autonomy_limit)
+        home.add_cascade(label="⚙️  自主进化设置", menu=evo_menu)
         home.add_separator()
         home.add_command(label="🧾  看她的记忆", command=self.show_memory)
         home.add_command(label="📝  打开相处笔记", command=self.open_learned_notes)
@@ -3608,9 +3628,11 @@ class PetApp:
         limit = int(self.config.get("autonomy_daily_limit", 20000) or 0)
         spent = self.appetite.eaten_by("self_improve")
         cap_text = "不限" if limit <= 0 else f"{limit}"
+        round_cap = int(self.config.get("self_improve_estimate_tokens", 0) or 0)
+        round_text = "不限" if round_cap <= 0 else str(round_cap)
         text = (f"{self.appetite.summary()}\n"
                 f"每日发放：{daily} token；自主进化今日已用：{spent} / {cap_text}；"
-                f"单轮预估上限：{self.config.get('self_improve_estimate_tokens', 5000)}")
+                f"单轮预估上限：{round_text}；频率：每 {self.config.get('self_improve_interval_min', 30)} 分钟")
         self.bubble.show(text, 8000)
 
     def _ask_token_int(self, title: str, prompt: str, current: int) -> int | None:
@@ -3645,12 +3667,42 @@ class PetApp:
     def set_autonomy_limit(self) -> None:
         value = self._ask_token_int(
             "自主进化每日上限", "自主进化每天最多花多少 token？（0 = 不限）",
-            int(self.config.get("autonomy_daily_limit", 20000) or 0))
+            int(self.config.get("autonomy_daily_limit", 0) or 0))
         if value is None:
             return
         self.config["autonomy_daily_limit"] = value
         self.save_config()
         self.bubble.show("自主进化每日上限设为 " + ("不限" if value <= 0 else f"{value} token"), 3600)
+
+    def set_autonomy_round_limit(self) -> None:
+        value = self._ask_token_int(
+            "自主进化单轮上限", "一轮自主进化最多花多少 token？（0 = 不限）",
+            int(self.config.get("self_improve_estimate_tokens", 0) or 0))
+        if value is None:
+            return
+        self.config["self_improve_estimate_tokens"] = value
+        self.save_config()
+        self.bubble.show("单轮上限设为 " + ("不限" if value <= 0 else f"{value} token"), 3600)
+
+    def set_autonomy_interval(self) -> None:
+        value = self._ask_token_int("自主进化频率", "每多少分钟自己进化一次？（10–1440）",
+                                    int(self.config.get("self_improve_interval_min", 30) or 30))
+        if value is None:
+            return
+        value = max(10, min(1440, int(value)))
+        self.config["self_improve_interval_min"] = value
+        self.save_config()
+        self.bubble.show(f"以后每 {value} 分钟自主进化一次。", 3600)
+
+    def set_autonomy_model(self, model: str) -> None:
+        self.config["autonomy_model"] = str(model or "")
+        try:
+            self.autonomy_model_var.set(str(model or ""))
+        except Exception:
+            pass
+        self.save_config()
+        label = model or "跟聊天同一个模型"
+        self.bubble.show(f"自主进化用：{label}", 3200)
 
     def feed_custom_tokens(self) -> None:
         value = self._ask_token_int("自定义投喂", "直接喂她多少 token？", 3000)
@@ -4053,11 +4105,11 @@ class PetApp:
             self.root.after(0, lambda: self.bubble.show(
                 "本鲸想自己优化，但今天的零食 token 不够了；喂一口再继续。", 4800))
             return
-        limit = int(self.config.get("autonomy_daily_limit", 20000) or 0)
+        limit = int(self.config.get("autonomy_daily_limit", 0) or 0)
         spent = self.appetite.eaten_by("self_improve") if hasattr(self, "appetite") else 0
-        if limit > 0 and spent + estimate > limit:
+        if limit > 0 and (spent >= limit or (estimate > 0 and spent + estimate > limit)):
             self.root.after(0, lambda: self.bubble.show(
-                f"自主进化今天已经用了 {spent} token，接近上限 {limit}；明天再继续。", 5200))
+                f"自主进化今天已经用了 {spent} token，达到/接近上限 {limit}；明天再继续。", 5200))
             return
         self._autonomy_busy = True
         try:
@@ -4080,7 +4132,8 @@ class PetApp:
                 "不要删除项目以外的东西；不要为了通过测试削弱安全/隐私边界。\n"
                 "6) 最后用中文写 5~10 行：你给自己加了什么能力、改了哪些文件、怎么验证、下一步想做什么。"
             )
-            result = self.agent.run(prompt, purpose="self_improve")
+            result = self.agent.run(prompt, purpose="self_improve",
+                                    model=(str(self.config.get("autonomy_model") or "").strip() or None))
             reply = str((result or {}).get("reply") or "").strip()
             steps = (result or {}).get("steps") or []
             if reply:
