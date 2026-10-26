@@ -2878,7 +2878,7 @@ class PetApp:
         home.add_command(label="📦  往窝里放点东西…", command=self.add_nest_item)
         home.add_command(label="📂  打开小窝文件夹", command=self.open_home)
         home.add_command(label="🧠  让她整理小屋/自省", command=self.reflect_home)
-        home.add_command(label="🧪  自主优化（可改代码/2D/3D/声音）…", command=self.autonomy_improve)
+        home.add_command(label="🧬  自主进化（模型/Agent/能力/外形）…", command=self.autonomy_improve)
         self.self_auto_var = tk.BooleanVar(value=bool(self.config.get("self_improve_autonomous")))
         home.add_checkbutton(label="⏱  每 30 分钟自主优化一次", variable=self.self_auto_var,
                              command=self.toggle_self_autonomy)
@@ -3965,15 +3965,15 @@ class PetApp:
         if getattr(self, "_autonomy_busy", False):
             return
         topics = {
-            "2D 动作/表情/桌面表现": "看看你的 2D 动画、表情、待机小动作和桌面表现，找一个很小的改进并实现。",
-            "3D 身体/动作/启动": "看看 body3d，修一个启动/动作/镜头问题，或加一个自然的待机动作；能跑 smoke 就验证。",
-            "小屋/记忆/相处": "看看 pet/home、相处笔记和记忆，把一个小屋/记忆行为改得更像自己的生活。",
-            "语音模型/声音/听写": "检查你的语音合成、听写和声音切换，找一个小问题修掉；需要查资料可以上网。",
-            "观察与活人感": "优化你对主人屏幕/在当前做什么的观察，让她更自然，不刷屏。",
-            "聊天/交互/菜单": "从最近对话和菜单里找一个真实的体验问题，做一个小的代码改进。",
+            "Agent 能力/工具/权限": "读 pet/agent.py、brain.py 和工具定义，自己想一个能真正增强你能力的小改动（新工具、工具描述、循环/错误恢复、权限边界），实现并测试。",
+            "语音模型/声音/听写": "检查 pet/voice.py、asr.py、config 中的声音/听写后端，必要时上网找更好的本地模型或参数，做一个可验证的改进。",
+            "外形/2D/3D/动作": "看看 2D 角色包、body3d、动画/表情/镜头，优化你自己的外形、动作或待机表现；能跑 smoke 就验证。",
+            "大脑/记忆/人格": "读 brain.py、persona、memory 和最近的相处记录，改进你的记忆、说话方式或自我认知；改完跑测试。",
+            "启动/性能/桌面体验": "看看启动流程、卡顿、窗口/托盘/菜单，挑一个实际的性能和体验问题修掉。",
+            "小屋/生活/活人感": "看看 pet/home、生活状态、看屏幕和主动行为，让你更像有自己的生活，但不刷屏。",
         }
         chosen = topic or random.choice(list(topics))
-        goal = topics.get(chosen, topics["聊天/交互/菜单"])
+        goal = topics.get(chosen, topics["Agent 能力/工具/权限"])
         estimate = int(self.config.get("self_improve_estimate_tokens", 5000) or 5000)
         if hasattr(self, "appetite") and not self.appetite.can_afford("self_improve", estimate):
             self.root.after(0, lambda: self.bubble.show(
@@ -3982,17 +3982,23 @@ class PetApp:
         self._autonomy_busy = True
         try:
             prompt = (
-                "你是小鲸鱼，在主人明确授权下自主优化你自己。你可以使用 web_search / web_fetch 查公开资料，"
-                "可以 list_dir/read_file/search_files/write_file 修改本项目自己的代码、2D 素材、body3d、pet/home、"
-                "语音/听写/模型相关文件，也可以用 run_powershell 在项目内备份、安装依赖、跑测试。"
-                f"这一轮只选一个具体小目标：{goal}\n"
-                "规则：\n"
-                "1) 先读相关文件和最近记忆，不要凭想象改；需要时先上网查。\n"
-                "2) 改之前把要改的文件备份到 pet/home/backups/ 下一个带时间戳的目录；只做一个可验证的小改动。\n"
-                "3) 改完必须运行相关测试（优先 python -m pytest -q pet/tests；3D 用 body3d 的 smoke）验证。\n"
-                "4) 如果失败，用备份恢复并如实报告，不要装作成功。\n"
-                "5) 绝对不要读/改 个人配置、密钥文件、其他个人数据；不要外发、不要 git push、不要删除项目以外的东西。\n"
-                "6) 最后用中文写 5~10 行：目标、改了什么文件、怎么验证、还差什么。"
+                "你是小鲸鱼，主人已明确给你很高的自主权限：你可以优化你自己的模型、Agent、功能、能力、外形、"
+                "2D/3D 身体、语音/听写/视觉、记忆、人格、桌面程序和启动方式。这不是只写小屋笔记；"
+                "目标由你根据当前代码和实际体验自己判断，不限于下面这一条。\n"
+                "你可以使用 web_search / web_fetch 查公开资料；可以 list_dir/read_file/search_files/write_file "
+                "修改本项目自己的代码（pet/*.py，包括 app/brain/agent/api_server/voice/asr）、body3d、"
+                "pet/assets、tools、plugin；可以新建模块/工具/测试；可以用 run_powershell 在项目内备份、"
+                "安装 Python 包、下载模型/素材、跑测试。也可以调整 config.json 中非敏感的能力/模型/声音/外形选项，"
+                "但绝不能读或写 API Key、token、密钥字段。\n"
+                f"这一轮先选一个具体、能验证的目标：{goal}\n"
+                "流程：\n"
+                "1) 先读 AGENTS.md、docs/STATUS.md、相关代码和最近记忆，判断真实缺口；需要时先上网查。\n"
+                "2) 改之前把要改的文件备份到 pet/home/backups/ 下一个带时间戳的目录；一轮只做一个可验证的改动。\n"
+                "3) 改完必须跑相关测试（优先 python -m pytest -q pet/tests；3D 用 body3d 的 smoke）。\n"
+                "4) 如果失败，用备份恢复并如实报告；不要改测试来假装通过。\n"
+                "5) 绝对不要读/改 个人配置、密钥文件、其他个人数据；不要外发、不要 git push、"
+                "不要删除项目以外的东西；不要为了通过测试削弱安全/隐私边界。\n"
+                "6) 最后用中文写 5~10 行：你给自己加了什么能力、改了哪些文件、怎么验证、下一步想做什么。"
             )
             result = self.agent.run(prompt)
             reply = str((result or {}).get("reply") or "").strip()
@@ -4020,7 +4026,7 @@ class PetApp:
         self.config["self_improve_autonomous"] = enabled
         self.save_config()
         if enabled:
-            self.bubble.show("好，我每 30 分钟自己查资料、改一点自己；token 不够会停。", 4600)
+            self.bubble.show("好，我每 30 分钟自己查资料、改一点自己的模型/能力/外形；token 不够会停。", 4600)
             threading.Thread(target=self._autonomy_self_improve_worker, daemon=True).start()
         else:
             self.bubble.show("先不自己改了，等我叫你。", 2800)
