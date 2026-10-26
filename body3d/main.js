@@ -33,7 +33,10 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       backgroundThrottling: false,
-      additionalArguments: [...(SMOKE ? ['--dfy-smoke'] : []), ...(process.argv.some((a) => a.startsWith('--shot=')) ? ['--dfy-shot'] : [])],
+      additionalArguments: [...(SMOKE ? ['--dfy-smoke'] : []), ...(process.argv.some((a) => a.startsWith('--shot=')) ? ['--dfy-shot'] : []),
+        // 调色对照用：DFY_BG 铺不透明底色，DFY_SHADING 临时换打光方案（平时不设）
+        ...(process.env.DFY_BG ? [`--dfy-bg=${process.env.DFY_BG}`] : []),
+        ...(process.env.DFY_SHADING ? [`--dfy-shading=${process.env.DFY_SHADING}`] : [])],
     },
   });
   win.setIgnoreMouseEvents(true, { forward: true }); // 默认点穿，鼠标在身体上时渲染端会关掉

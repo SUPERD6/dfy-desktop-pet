@@ -5,7 +5,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from interactions import (DRAG_LINES, FOOD_EMOJI, FEED_LINES, INNER_VOICE_LINES, actions_in,
-                          render_food, state_for_actions, step_flight, visible_ratio)
+                          pat_event, pat_fallbacks, render_food, state_for_actions, step_flight,
+                          visible_ratio)
 
 
 class InteractionHelpersTest(unittest.TestCase):
@@ -24,6 +25,13 @@ class InteractionHelpersTest(unittest.TestCase):
         self.assertLess(vx, 100)
         self.assertGreater(vy, 0)
         self.assertFalse(landed)
+
+    def test_rapid_pats_are_merged_into_one_event(self):
+        self.assertIn("一下", pat_event(1))
+        self.assertIn("5", pat_event(5))
+        self.assertIn("12", pat_event(12))
+        self.assertTrue(pat_fallbacks(10))
+        self.assertNotEqual(pat_event(1), pat_event(10))
 
     def test_flight_bounces_off_edge_and_stops_on_floor(self):
         x, y, vx, vy, landed = step_flight(495, 100, 500, 0, 0.05, 0, 0, 500, 480)

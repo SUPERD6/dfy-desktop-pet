@@ -75,6 +75,13 @@ class LifeState:
                                            if isinstance(v, (int, float))}
         self.mood_log: list[dict] = [e for e in (extra.get("mood_log") or []) if isinstance(e, dict)][-60:]
         self.unsaid: str = str(extra.get("unsaid") or "")
+        # 关系层：不是每次互动都重算，而是慢慢积累；越熟越会主动靠近、也越敢闹脾气
+        try:
+            self.trust = max(0.0, min(100.0, float(extra.get("trust", 35.0))))
+            self.closeness = max(0.0, min(100.0, float(extra.get("closeness", 20.0))))
+            self.curiosity = max(0.0, min(100.0, float(extra.get("curiosity", 60.0))))
+        except (TypeError, ValueError):
+            self.trust, self.closeness, self.curiosity = 35.0, 20.0, 60.0
 
     # ---------- 存取 ----------
     @classmethod
@@ -96,7 +103,9 @@ class LifeState:
         data = {"needs": {k: round(v, 2) for k, v in self.needs.items()}, "last_update": self.last_update,
                 "last_done": self.last_done, "diary_day": self.diary_day, "recent": self.recent,
                 "asleep": self.asleep, "feelings": {k: round(v, 2) for k, v in self.feelings.items()},
-                "mood_log": self.mood_log[-60:], "unsaid": self.unsaid}
+                "mood_log": self.mood_log[-60:], "unsaid": self.unsaid,
+                "trust": round(self.trust, 1), "closeness": round(self.closeness, 1),
+                "curiosity": round(self.curiosity, 1)}
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(tmp, path)
@@ -138,6 +147,9 @@ class LifeState:
             return
         now = float(now or time.time())
         self.needs["mood"] = _clamp(self.needs["mood"] + delta * 4)
+        if delta > 0:
+            self.trust = min(100.0, self.trust + 0.3)
+            self.closeness = min(100.0, self.closeness + 0.2)
         if emotion and emotion != "平静":
             self.feelings[emotion] = self.feelings.get(emotion, 0.0) + abs(delta) * 2 + 1
         if delta != 0:
@@ -162,11 +174,19 @@ class LifeState:
         if kind.startswith("fed:"):
             fill = FOOD_FILL.get(kind.split(":", 1)[1], 20)
             self._apply({"hunger": -fill, "mood": 6, "social": -8})
+            self.trust = min(100.0, self.trust + 0.8)
+            self.closeness = min(100.0, self.closeness + 1.0)
             return
         if kind in EVENTS:
             self._apply(EVENTS[kind])
         if kind in ("pat", "chat", "toss") and self.asleep:
             self.asleep = False  # 被弄醒了
+        if kind == "pat":
+            self.trust = min(100.0, self.trust + 0.6)
+            self.closeness = min(100.0, self.closeness + 1.2)
+        elif kind == "chat":
+            self.trust = min(100.0, self.trust + 0.4)
+            self.closeness = min(100.0, self.closeness + 0.6)
 
     def _apply(self, delta: dict) -> None:
         for key, value in delta.items():
@@ -195,15 +215,15 @@ class LifeState:
         night = is_night(hour)
         today = time.strftime("%Y-%m-%d", time.localtime(now))
         s = {
-            "idle": 18.0,
-            "stroll": 10.0 + n["boredom"] * 0.35,
+            "idle": 10.0,
+            "stroll": 22.0 + n["boredom"] * 0.35,
             "climb_window": n["boredom"] * 0.45,
             "peek_edge": n["boredom"] * 0.30,
             "nap": max(0.0, 70 - n["energy"]) * 1.2 + (35 if night else 0),
             "snack": max(0.0, n["hunger"] - 45) * 1.3,
             "dance": max(0.0, n["mood"] - 60) * 0.5 + n["boredom"] * 0.15,
             "browse_file": n["boredom"] * 0.35,
-            "chase_mouse": n["boredom"] * 0.25 + max(0.0, n["mood"] - 60) * 0.2,  # 追着主人的鼠标跑
+            "chase_mouse": 6.0 + n["boredom"] * 0.25 + max(0.0, n["mood"] - 60) * 0.2,  # 追着主人的鼠标跑
             "write_diary": 0.0,
             "call_master": max(0.0, n["social"] - 55) * 1.4,
         }
@@ -219,10 +239,9 @@ class LifeState:
         if self.asleep and n["energy"] < 90:
             s = {k: (v if k in ("nap", "idle") else v * 0.1) for k, v in s.items()}
             s["nap"] += 40
-        if user_active:  # 主人在忙：少折腾、不叫人、不翻文件
+        if user_active:  # 主人在忙：不叫人、不翻文件、不爬窗挡视线，但还是会在脚下走走、追追鼠标
             for activity in ("climb_window", "peek_edge", "dance", "browse_file", "call_master", "write_diary"):
                 s[activity] = 0.0
-            s["idle"] += 15
         for back, activity in enumerate(reversed(self.recent)):  # 刚做过的降权
             if activity in s and activity != "idle":
                 s[activity] *= 0.35 + 0.15 * back
@@ -270,4 +289,10 @@ class LifeState:
         feeling = self.top_feeling()
         parts.append(f"有点{feeling}" if feeling else
                      "心情好" if n["mood"] >= 70 else "心情一般" if n["mood"] >= 40 else "心情低落")
-        return "，".join(parts)[:40]
+        if self.closeness >= 75:
+            parts.append("和主人很亲")
+        elif self.closeness >= 45:
+            parts.append("和主人有点熟了")
+        if self.trust < 25:
+            parts.append("还有点防备")
+        return "，".join(parts)[:52]

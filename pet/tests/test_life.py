@@ -56,6 +56,12 @@ class LifeStateTest(unittest.TestCase):
         idle_counts = pick_many(state, NOON, 15, False)
         self.assertGreater(idle_counts["call_master"] + idle_counts["climb_window"], 0)
 
+    def test_moves_around_even_when_user_busy(self):
+        """主人在用电脑时她也该常在脚下走动，而不是一直站着（2026-10-25 主人反馈「她不会动」）。"""
+        state = LifeState({"boredom": 30, "energy": 80, "mood": 60}, last_update=NOON)
+        counts = pick_many(state, NOON, 15, True)
+        self.assertGreater(counts["stroll"] + counts["chase_mouse"], counts["idle"])
+
     def test_diary_once_per_day_and_cooldowns(self):
         evening = time.mktime((2026, 10, 25, 21, 0, 0, 0, 0, -1))
         state = LifeState({"energy": 90}, last_update=evening)

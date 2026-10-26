@@ -64,6 +64,31 @@ class StreamTests(unittest.TestCase):
         self.assertTrue(reply)
         self.assertEqual(json.loads(events[-2][1])["delta"]["stop_reason"], "end_turn")
 
+    def test_real_usage_reported(self):
+        """DSH 界面上的「用量」要是她这一轮真用掉的 token，不是 0。"""
+        original = self.brain.reply
+
+        def fake_reply(text):
+            self.brain._tl.usage = {"prompt_tokens": 1200, "completion_tokens": 40, "prompt_cache_hit_tokens": 1000}
+            return "嗯", "llm"
+
+        self.brain.reply = fake_reply
+        try:
+            _, body = post("/v1/messages", {"messages": [{"role": "user", "content": "嗨"}]})
+            _, text = post("/v1/messages", {"stream": True, "messages": [{"role": "user", "content": "嗨"}]})
+        finally:
+            self.brain.reply = original
+        self.assertEqual(json.loads(body)["usage"], {"input_tokens": 200, "cache_read_input_tokens": 1000,
+                                                     "output_tokens": 40})
+        events = sse_events(text)
+        self.assertEqual(json.loads(events[0][1])["message"]["usage"]["input_tokens"], 200)
+        self.assertEqual(json.loads(events[-2][1])["usage"]["output_tokens"], 40)
+
+    def test_messages_path_with_query_string(self):
+        """Anthropic SDK（DSH「自定义模型 API」）会请求 /v1/messages?beta=true。"""
+        _, body = post("/v1/messages?beta=true", {"messages": [{"role": "user", "content": "嗨"}]})
+        self.assertEqual(json.loads(body)["type"], "message")
+
     def test_compaction_is_summary_and_not_remembered(self):
         before = len(self.brain.memory_store.history)
         _, text = post("/v1/messages", {"stream": True, "messages": [
@@ -84,6 +109,16 @@ class StreamTests(unittest.TestCase):
 
     def test_compact_summary_helper(self):
         self.assertEqual(compact_summary([]), "（之前没有可总结的对话）")
+
+    def test_dsh_reminders_stripped_and_title_not_remembered(self):
+        before = len(self.brain.memory_store.history)
+        post("/v1/messages", {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "hey <system-reminder>\nThe following workspace instructions...\n</system-reminder>"}]}]})
+        self.assertEqual(self.brain.memory_store.history[-2]["content"], "hey")  # 进记忆的只有主人说的话
+        _, body = post("/v1/messages", {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": 'Generate the session title from this JSON array of human messages: ["今天考试好难"]'}]}]})
+        self.assertEqual(json.loads(body)["content"][0]["text"], "今天考试好难")
+        self.assertEqual(len(self.brain.memory_store.history), before + 2)  # 起标题没进记忆
 
 
 if __name__ == "__main__":

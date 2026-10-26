@@ -13,6 +13,7 @@ const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, preserv
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.setSize(W, H);
 renderer.setClearColor(0x000000, 0);
+if (dfy.bg) renderer.setClearColor(new THREE.Color(dfy.bg), 1); // 调色对照：铺和参考图一样的底色
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 document.body.appendChild(renderer.domElement);
 
@@ -76,12 +77,19 @@ async function setupSimple(root, url) {
   try { opts = await (await fetch(url.replace(/\.glb$/, '.json'))).json(); } catch { /* 没有就用默认 */ }
   const rot = (opts.rotation || [0, 0, 0]).map((d) => THREE.MathUtils.degToRad(d));
   root.rotation.set(rot[0], rot[1], rot[2]);
+  // 打光方案（同名 .json 的 shading，或调色对照时的 DFY_SHADING）：
+  //   flat（默认）：不受光。图生 3D 的颜色取自原画，原画已画好明暗，再打光会发暗发脏（实测）。
+  //     TripoSR 的顶点色整体偏暗，用 brightness（线性空间里的乘数，白色会封顶）提回原画的亮度与对比；
+  //     数值按原画对照实测选定。试过按全部顶点做直方图匹配：背面/内部顶点占多数，看得见的正面反而发白，已弃用。
+  //   soft：Lambert + 环境光与正面主光，留作对照。
+  const [shadingName, shadingArg] = (dfy.shading || opts.shading || 'flat').split(':');
+  const shading = shadingName;
+  const brightness = shading === 'flat' && shadingArg ? Number(shadingArg) : (opts.brightness || 1.4);
   root.traverse((o) => {
     if (o.isMesh) {
       o.frustumCulled = false;
       const color = o.geometry.attributes.color;
-      if (color && !o.geometry.userData.linearized) {
-        // 图生 3D 导出的顶点色是 sRGB，渲染器按线性色算 → 发灰发白；先换算成线性
+      if (color && !o.geometry.userData.linearized) { // 顶点色是 sRGB，换成渲染器计算用的线性色
         const c = new THREE.Color();
         for (let i = 0; i < color.count; i += 1) {
           c.setRGB(color.getX(i), color.getY(i), color.getZ(i), THREE.SRGBColorSpace);
@@ -90,10 +98,17 @@ async function setupSimple(root, url) {
         color.needsUpdate = true;
         o.geometry.userData.linearized = true;
       }
-      // 二次元配色：不要太多高光，用 Lambert + 顶点颜色
-      o.material = new THREE.MeshLambertMaterial({ vertexColors: Boolean(color), color: color ? 0xffffff : 0x9fb8e8 });
+      const tint = color ? new THREE.Color(brightness, brightness, brightness) : new THREE.Color(0x9fb8e8);
+      const params = { vertexColors: Boolean(color), color: tint };
+      o.material = shading === 'flat' ? new THREE.MeshBasicMaterial(params) : new THREE.MeshLambertMaterial(params);
     }
   });
+  // soft 的灯光：环境光 + 正面偏上的主光，两者之和≈1，正面亮度≈原画，侧面略暗出立体感
+  const [ambientLevel, keyLevel] = (dfy.shading && dfy.shading.includes(':'))
+    ? dfy.shading.split(':')[1].split(',').map(Number) : (opts.light || [0.8, 0.35]);
+  ambient.intensity = ambientLevel;
+  sun.intensity = keyLevel;
+  sun.position.set(0.3, 0.8, 2.0);
   const holder = new THREE.Group();
   holder.add(root);
   holder.updateMatrixWorld(true);
@@ -101,8 +116,6 @@ async function setupSimple(root, url) {
   const size = box.getSize(new THREE.Vector3());
   const scale = 1.0 / size.y; // 统一成 1 个单位高
   root.position.set(-(box.min.x + size.x / 2), -box.min.y, -(box.min.z + size.z / 2));
-  ambient.intensity = 1.25; // 整体模型只有顶点色，灯太亮会把配色冲淡
-  sun.intensity = 1.1;
   const pivot = new THREE.Group(); // 脚底为原点，转身、压扁都以脚为支点
   pivot.scale.setScalar(scale);
   pivot.add(holder);

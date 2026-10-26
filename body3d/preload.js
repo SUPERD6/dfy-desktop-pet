@@ -7,6 +7,8 @@ const RECEIVE = new Set(['cursor', 'pet-state']);
 contextBridge.exposeInMainWorld('dfy', {
   smoke: process.argv.includes('--dfy-smoke'),
   shot: process.argv.includes('--dfy-shot'),
+  bg: (process.argv.find((a) => a.startsWith('--dfy-bg=')) || '').slice(9),
+  shading: (process.argv.find((a) => a.startsWith('--dfy-shading=')) || '').slice(14),
   send: (channel, data) => { if (SEND.has(channel)) ipcRenderer.send(channel, data); },
   on: (channel, callback) => {
     if (RECEIVE.has(channel)) ipcRenderer.on(channel, (_event, data) => callback(data));

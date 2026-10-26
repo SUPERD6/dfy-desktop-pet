@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import random
 import threading
@@ -83,6 +84,7 @@ class Living:
         self._job = None
         self.foot_pad = 10 + app.pet_h * 0.025
         self._chase_until = 0.0
+        self._step_phase = 0.0
         self._mouse_last = None      # (x, y, t)
         self._stare_since = 0.0
         self._stare_said = 0.0
@@ -91,6 +93,8 @@ class Living:
 
     # ---------------------------------------------------------- 开关
     def enabled(self) -> bool:
+        if self.app.config.get("free_placement", True):
+            return False
         return bool(self.cfg.get("enabled", True)) and not self.app.hidden
 
     def start(self) -> None:
@@ -135,9 +139,12 @@ class Living:
             self.platforms = [desktop.Platform(left, right, bottom, 0, "地面")]
 
     # ---------------------------------------------------------- 外部事件
+    def _has_walk(self) -> bool:
+        return "walk" in getattr(self.app.library, "states", {})
+
     def busy(self) -> bool:
         app = self.app
-        return bool(app._drag or app._flight is not None or app._eating)
+        return bool(app._drag or app._flight is not None or app._eating or getattr(app, "_entering", False))
 
     def toss(self, vx: float, vy: float) -> None:
         """被甩出去：交给这里的物理，能落在窗口上。"""
@@ -183,7 +190,7 @@ class Living:
     def _quiet(self) -> bool:
         app = self.app
         return (self.mode == "stand" and not app._busy and not app._speaking and not app._eating
-                and app._dsh_state in ("idle", "disconnected") and time.time() - app._last_interaction > 15)
+                and app._dsh_state in ("idle", "disconnected") and time.time() - app._last_interaction > 8)
 
     def _physics(self, dt: float) -> None:
         fx, fy = self.foot()
@@ -201,7 +208,10 @@ class Living:
                 self.vx = -self.vx * 0.5
             if fy < top:
                 fy, self.vy = top, abs(self.vy) * 0.4
+            self.vy = min(self.vy, 2500.0)  # 限速，免得一帧穿过平台
             land = landing_below(self.platforms, fx, prev_y) if self.vy > 0 else None
+            if land is None and fy > bottom:  # 已经在地面以下（比如被放到任务栏下面）：直接站回地面
+                land = next((q for q in self.platforms if q.hwnd == 0), None)
             if land is not None and fy >= land.y:
                 fy = land.y
                 if self.vy > 900:  # 摔得重：弹一下，喊一声
@@ -248,7 +258,9 @@ class Living:
                 fx += step if self.target_x > fx else -step
             if fx < p.x1 - 2 or fx > p.x2 + 2:  # 走出边缘：掉下去
                 self.mode, self.vx, self.vy = "fall", (40 if fx > p.x2 else -40), 0.0
-            self.place_foot(fx, fy)
+            self._step_phase += dt * 9
+            hop = 0.0 if self.mode != "walk" or self._has_walk() else abs(math.sin(self._step_phase)) * 7
+            self.place_foot(fx, fy - hop)  # 角色包没有走路动画：一蹦一蹦地走，看得出在动
 
     def _land(self, platform) -> None:
         self.mode, self.vx, self.vy = "stand", 0.0, 0.0
@@ -341,7 +353,7 @@ class Living:
         user_active = desktop.user_idle_seconds() < 20
         activity = self.state.choose(now, hour, user_active)
         self.do(activity)
-        self.next_decide = now + random.uniform(10, 25) * (6 if activity == "nap" else 1)
+        self.next_decide = now + random.uniform(6, 14) * (4 if activity == "nap" else 1)
 
     def do(self, activity: str) -> None:
         self.activity = activity
@@ -353,7 +365,8 @@ class Living:
         if activity == "stroll" and p is not None:
             lo, hi = p.x1 + 40, p.x2 - 40
             if hi - lo > 80:
-                self.walk_to(random.uniform(lo, hi))
+                far = [x for x in (random.uniform(lo, hi) for _ in range(6)) if abs(x - fx) >= 160]
+                self.walk_to(far[0] if far else random.uniform(lo, hi))  # 尽量走远一点，别原地挪两步
                 if random.random() < 0.3:
                     self._sound(HUM_SOUNDS)
         elif activity == "climb_window":

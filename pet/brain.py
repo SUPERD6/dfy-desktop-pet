@@ -333,6 +333,63 @@ class Brain:
         self.partner_path = self.dir / "PARTNER.md"
         self.partner_text = ""
         self._load_partner()
+        try:
+            self.seed_memory_from_personal()
+        except Exception as exc:
+            self.log(f"记忆初始化跳过：{exc}")
+
+    def seed_memory_from_personal(self) -> int:
+        """记忆还是空的时候，用个人库里的身份/偏好打底，别让记忆窗口一开始就是空的。
+
+        只读个人库，不写回；已经有事实就不动，避免覆盖她自己学到的东西。
+        """
+        if getattr(self, "personal", None) is None or self.memory_store.facts:
+            return 0
+        fields = getattr(self.personal, "fields", {}) or {}
+        profile_lines = list(getattr(self.personal, "profile_lines", []) or [])
+        preferences = getattr(self.personal, "preferences", []) or []
+        candidates: list[tuple[str, str, int]] = []
+        labels = {
+            "name": ("主人叫{}", "identity"),
+            "school": ("主人在{}", "identity"),
+            "degree": ("主人是{}", "identity"),
+            "direction": ("主人更偏好{}", "like"),
+            "goal": ("主人的目标是{}", "event"),
+        }
+        for key, (template, kind) in labels.items():
+            value = str(fields.get(key) or "").strip()
+            if value:
+                candidates.append((template.format(value), kind, 3))
+        for line in profile_lines[:6]:
+            line = str(line).strip()
+            if 8 <= len(line) <= 70:
+                candidates.append((line, "note", 2))
+        if isinstance(preferences, dict):
+            pref_items = list(preferences.items())
+        else:
+            pref_items = list(preferences)
+        for item in pref_items[:5]:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                text = f"主人偏好：{item[0]}——{item[1]}"
+            else:
+                text = f"主人偏好：{item}"
+            text = str(text).strip()
+            if 5 <= len(text) <= 80:
+                candidates.append((text, "like", 2))
+        added = 0
+        for text, kind, importance in candidates:
+            try:
+                if self.memory_store.add_fact(text, kind=kind, importance=importance):
+                    added += 1
+            except Exception:
+                continue
+        if added:
+            try:
+                self.memory_store.save()
+            except Exception:
+                pass
+            self.log(f"记忆初始化：从个人库写入 {added} 条事实")
+        return added
 
     # ---------- 对外：聊天 ----------
     def reply(self, text: str) -> tuple[str, str]:
@@ -852,6 +909,25 @@ class Brain:
             {"role": "user", "content": text},
         ]
 
+    def react(self, event: str, fallback: str = "") -> str:
+        """对「主人摸了一下/喂了一口/路过」这种小事件做一个即兴反应。
+
+        不查预设台词；用她的人设 + 当前上下文 + 记忆让模型自己说一句短的。
+        失败就返回调用方给的 fallback，不阻塞桌宠。
+        """
+        if not self._llm_ready():
+            return fallback
+        prompt = (f"刚刚发生了一件事：{event}。\n"
+                  "用你自己（小鲸鱼）的口吻对主人做一个很短的反应，1～2 句，不超过 40 字；"
+                  "可以带一个括号小动作；不要解释、不要列点、不要问我问题。")
+        try:
+            line = self._call_llm(prompt)
+        except Exception as exc:
+            self.log(f"即兴反应失败：{self._redact(str(exc))}")
+            return fallback
+        line = (line or "").strip().splitlines()[0].strip()
+        return line[:80] or fallback
+
     def _call_llm(self, text: str) -> str:
         key, _source = self._resolve_api_key()
         if not key:
@@ -861,6 +937,44 @@ class Brain:
         messages = self._build_messages(text)
         answer = self._request_chat_with_retries(messages, options, key)
         return self._clean_line(self.absorb_mood(answer))  # 先拆心情标记，_clean_line 只留第一行
+
+    def see_image(self, image_path: Path, prompt: str) -> str:
+        """用主人自己的 DeepSeek API 直接看图（V4.1 Flash 原生支持 image_url）。
+
+        返回一句中文描述；失败返回空串，让调用方回退到 Claude/配置的视觉模型。
+        """
+        import base64
+
+        key, _source = self._resolve_api_key()
+        if not key:
+            return ""
+        try:
+            image_bytes = Path(image_path).read_bytes()
+        except OSError:
+            return ""
+        mime = "image/jpeg" if Path(image_path).suffix.lower() in (".jpg", ".jpeg") else "image/png"
+        data_url = f"data:{mime};base64," + base64.b64encode(image_bytes).decode("ascii")
+        text = ("你在看主人桌面的截图。请用中文客观描述：主人在用什么程序、在做什么、"
+                "画面里值得注意的文字/界面。不要编造看不清的内容，不要复述隐私全文。"
+                + (("\n额外关注：" + prompt) if prompt else ""))
+        self._tl.purpose = "vision"
+        options = self._llm_options()
+        options.update({"max_tokens": 800, "timeout_s": max(60.0, float(options.get("timeout_s", 30))),
+                        "disable_thinking": True})
+        messages = [
+            {"role": "system", "content": "你是视觉观察助手：只客观描述图片里实际可见的内容，"
+                                          "不代入角色、不编造、不输出隐私全文。用中文简短回答。"},
+            {"role": "user", "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]},
+        ]
+        try:
+            answer = self._request_chat_with_retries(messages, options, key)
+        except Exception as exc:
+            self.log("原生视觉读取失败：" + self._redact(str(exc))[:120])
+            return ""
+        return (answer or "").strip()[:900]
 
     def absorb_mood(self, reply: str) -> str:
         """拆掉回复末尾的〔心情 ±N 情绪〕，记到 last_mood（app 拿去更新她的心情）；返回干净的回复。"""
@@ -881,6 +995,12 @@ class Brain:
                 time.sleep(0.2 * (attempt + 1))  # 简单退避：0.2s / 0.4s
         raise last_error or LLMError("模型调用失败")
 
+    def take_usage(self) -> dict:
+        """取走本线程从上次取走到现在累计的真实 token 用量（共用大脑接口回给 DSH 用）。"""
+        usage = getattr(self._tl, "usage", None) or {}
+        self._tl.usage = None
+        return usage
+
     def _request_chat(self, messages: list[dict], options: dict, key: str) -> str:
         """发一次 /chat/completions；把各种失败翻译成友好的 LLMError。"""
         url = self._chat_url(options["base_url"])
@@ -891,6 +1011,9 @@ class Brain:
             "max_tokens": options["max_tokens"],
             "stream": False,
         }
+        if options.get("disable_thinking"):
+            # V4.1 Flash 推理 token 常比答案还多；看图只要描述时关掉，省一半以上。
+            payload["thinking"] = {"type": "disabled"}
         request = urllib.request.Request(
             url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -922,6 +1045,11 @@ class Brain:
             raise LLMError("模型接口返回了无法解析的内容", retryable=False) from None
         if self.appetite is not None and isinstance(data, dict):  # 这一口吃了多少 token
             self.appetite.eat(data.get("usage"), getattr(self._tl, "purpose", "chat"))
+        if isinstance(data, dict) and isinstance(data.get("usage"), dict):  # 记到本线程，接口回给 DSH 显示用量
+            total = getattr(self._tl, "usage", None) or {}
+            for k in ("prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens"):
+                total[k] = total.get(k, 0) + int(data["usage"].get(k) or 0)
+            self._tl.usage = total
         try:
             answer = (data["choices"][0]["message"]["content"] or "").strip()
         except (KeyError, IndexError, TypeError):

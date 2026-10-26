@@ -16,7 +16,7 @@
 2. `model.glb` / `mingyue_q.glb`：从 2D 立绘「图生 3D」得到的整体模型，没有骨骼，动作靠整体转向、呼吸、蹦跳、歪头、压扁回弹；
 3. `sample.vrm`：three-vrm 仓库的示例模型，只用来验证链路。
 
-整体模型旁边可放同名 `.json` 指定摆正角度，例如 `mingyue_q.json`：`{"rotation": [-90, 0, 90]}`（度）。
+整体模型旁边可放同名 `.json`：`rotation` 摆正角度（度）；`shading` 默认 `flat`（不打光，颜色取自原画）；`brightness` 默认 1.4（TripoSR 顶点色偏暗，按原画对照实测选定）。例如 `{"rotation": [-90, 0, 90], "brightness": 1.4}`。调色对照可用环境变量 `DFY_BG=#808080`、`DFY_SHADING=flat:1.4`。
 
 ### 从 2D 立绘生成 3D（本机显卡）
 

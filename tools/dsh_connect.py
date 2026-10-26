@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
-"""把大肥鱼接进 DeepSeek Harness（DSH）的聊天：在 DSH 里选她这个模型，说的话直接交给她的大脑。
+"""【不推荐，留作备用】改 DSH「DeepSeek（API Key）」路由来接大肥鱼。
+
+推荐改用 DSH「设置 → 模型 → 添加模型提供商 → 自定义模型 API」：单独一个提供商，不占用原路由
+（协议 Anthropic Messages、地址 http://127.0.0.1:8765、模型 ID dfy-companion；已用 DSH 自带 pi-ai 库实测）。
+注意：在 DSH 里选过她之后，DSH 会把她记成默认模型；撤销本脚本后要把默认模型改回来。
+
+原说明：把大肥鱼接进 DeepSeek Harness（DSH）的聊天：在 DSH 里选她这个模型，说的话直接交给她的大脑。
 
 原理：DSH 的「DeepSeek API Key」路由（配置项 llm-deepseek，provider = deepseek-official）可以改服务地址。
 指到桌宠的共用大脑 http://127.0.0.1:8765 后，DSH 发来的 Anthropic Messages 请求由 pet/api_server.py 的

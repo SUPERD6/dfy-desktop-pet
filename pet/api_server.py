@@ -13,9 +13,15 @@
 from __future__ import annotations
 
 import json
+import mimetypes
+import os
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ASSET_ROOT = Path(__file__).resolve().parent / "assets"
 
 
 CHAT_HTML = """<!doctype html>
@@ -109,6 +115,32 @@ form.addEventListener('submit', (e) => { e.preventDefault(); send(); });
 """
 
 
+_REMINDER_RE = re.compile(r"<system-reminder>.*?(</system-reminder>|$)", re.S)
+_TITLE_PREFIX = "Generate the session title"
+
+
+def clean_user_text(text: str) -> str:
+    """去掉 DSH 塞进用户消息里的 <system-reminder>（工作区说明等），只留主人真正说的话。"""
+    return re.sub(r"\s+", " ", _REMINDER_RE.sub(" ", str(text or ""))).strip()
+
+
+def title_request(text: str) -> str | None:
+    """DSH 让模型给会话起标题：返回一个标题（取主人第一句话），不是聊天、不交给她、不进记忆。"""
+    if not str(text or "").lstrip().startswith(_TITLE_PREFIX):
+        return None
+    first = ""
+    match = re.search(r"\[.*\]", text, re.S)
+    if match:
+        try:
+            items = json.loads(match.group(0))
+            first = next((clean_user_text(i if isinstance(i, str) else i.get("text", "")) for i in items
+                          if clean_user_text(i if isinstance(i, str) else i.get("text", ""))), "")
+        except (ValueError, AttributeError, TypeError):
+            first = ""
+    first = re.sub(r"[\r\n]+", " ", first).strip(" ，。！？,.!?")
+    return (first[:18] or "和她聊天")
+
+
 def compact_summary(messages) -> str:
     """DSH 要求压缩上下文时的摘抄式摘要：按顺序列出双方说过的话（截短），不调模型。"""
     lines = []
@@ -123,6 +155,160 @@ def compact_summary(messages) -> str:
             who = "主人" if item["role"] == "user" else "她"
             lines.append(f"{who}：{content[:80]}")
     return "之前的对话摘要：\n" + "\n".join(lines[-30:]) if lines else "（之前没有可总结的对话）"
+
+
+AVATAR_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{NAME}} · 2D 虚拟形象</title>
+<style>
+  :root { --ink:#1f2a44; --blue:#4a7cf0; --soft:#eaf2ff; --cream:#fff8e6; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; color:var(--ink); font-family:"Microsoft YaHei","PingFang SC",sans-serif;
+         background:radial-gradient(1200px 700px at 22% 20%, #f8fbff, #e9f1ff 45%, #fff7ea); display:flex; align-items:center; justify-content:center; }
+  .wrap { width:min(1180px,96vw); height:min(760px,92vh); display:flex; gap:18px; padding:18px; }
+  .stage { flex:1.05; position:relative; border-radius:26px; overflow:hidden;
+           background:linear-gradient(160deg,#dbe9ff,#f4f9ff 55%,#fff1df);
+           box-shadow:0 20px 60px rgba(70,100,160,.22); display:flex; align-items:flex-end; justify-content:center; }
+  .stage:after { content:""; position:absolute; inset:auto -15% -30% -15%; height:45%; border-radius:50%;
+                 background:radial-gradient(closest-side,rgba(90,140,220,.18),transparent); }
+  #pet { width:min(78%,560px); max-height:94%; object-fit:contain; image-rendering:auto; filter:drop-shadow(0 16px 25px rgba(40,70,120,.16)); }
+  .status { position:absolute; left:22px; top:20px; background:rgba(255,255,255,.86); border:1px solid #cfe0fb;
+            border-radius:999px; padding:7px 13px; font-size:12px; color:#4b6390; backdrop-filter:blur(6px); }
+  .panel { flex:.95; background:#fff; border-radius:26px; display:flex; flex-direction:column; overflow:hidden;
+           box-shadow:0 20px 60px rgba(70,100,160,.18); }
+  header { padding:16px 20px; background:linear-gradient(120deg,#eaf2ff,#fff6e6); border-bottom:1px solid #e7eefb; }
+  header .name { font-size:17px; font-weight:700; }
+  header .tag { color:#6d80a6; font-size:12px; margin-top:2px; }
+  #log { flex:1; overflow-y:auto; padding:18px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:85%; padding:10px 13px; border-radius:15px; line-height:1.55; font-size:14px; white-space:pre-wrap; }
+  .her { align-self:flex-start; background:var(--cream); border-bottom-left-radius:4px; }
+  .me { align-self:flex-end; background:var(--soft); border-bottom-right-radius:4px; }
+  .sys { align-self:center; color:#9aa8c4; font-size:11px; }
+  form { display:flex; gap:8px; padding:14px 16px 6px; border-top:1px solid #eef3fb; }
+  input { flex:1; border:1px solid #d8e4f7; border-radius:13px; padding:11px 13px; outline:none; font-size:14px; }
+  input:focus { border-color:var(--blue); box-shadow:0 0 0 3px rgba(74,124,240,.12); }
+  button { border:0; border-radius:13px; background:var(--blue); color:#fff; font-weight:700; padding:0 18px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .foot { padding:0 16px 12px; color:#8a98b5; font-size:11px; display:flex; gap:12px; align-items:center; }
+  .foot label { cursor:pointer; user-select:none; }
+  #overlayBar, #overlayReply { display:none; }
+  body.overlay .panel { display:none; }
+  body.overlay .wrap { position:relative; width:min(430px,100vw); height:min(680px,100vh); padding:0; }
+  body.overlay .stage { border-radius:0; min-height:100%; }
+  body.overlay #pet { width:min(92%,600px); }
+  body.overlay #overlayReply { display:block; position:absolute; left:16px; right:16px; bottom:66px; z-index:5;
+    background:rgba(255,255,255,.94); border:1px solid #cfe0fb; border-radius:15px; padding:10px 14px;
+    font-size:13px; line-height:1.55; max-height:32%; overflow:auto; box-shadow:0 10px 30px rgba(40,70,120,.18); }
+  body.overlay #overlayBar { display:flex; position:absolute; left:16px; right:16px; bottom:14px; gap:8px; z-index:6; }
+  body.overlay #overlayBar input { flex:1; border:1px solid #cfe0fb; border-radius:999px; padding:10px 14px;
+    font-size:13px; outline:none; background:rgba(255,255,255,.96); }
+  body.overlay #overlayBar button { width:42px; border-radius:50%; padding:0; }
+  body.overlay .status { left:16px; top:16px; }
+  @media (max-width:850px) { .wrap { flex-direction:column; height:auto; min-height:96vh; } .stage { min-height:46vh; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="stage">
+    <div class="status" id="status">待机</div>
+    <img id="pet" alt="小鲸鱼" src="/avatar-assets/characters/mingyue-q/anim/idle.webp">
+  </div>
+  <div class="panel">
+    <header><div class="name">{{NAME}}</div><div class="tag">2D 虚拟形象 · 共用大脑 · 只在本机</div></header>
+    <div id="log"><div class="msg her">唔……主人来啦。本鲸在桌面上等你呢，想聊什么？</div></div>
+    <form id="form"><input id="q" placeholder="跟小鲸鱼说句话…" autocomplete="off" autofocus><button id="send">发送</button></form>
+    <div class="foot"><label><input type="checkbox" id="voice" checked> 朗读回复</label><span>声音走本机；聊天和桌面共用记忆</span></div>
+  </div>
+  <div id="overlayReply">嗯？在呢，直接说。</div>
+  <div id="overlayBar"><input id="oq" placeholder="跟小鲸鱼说句话…" autocomplete="off"><button id="osend">↑</button></div>
+</div>
+<script>
+const pet = document.getElementById('pet');
+const status = document.getElementById('status');
+const log = document.getElementById('log');
+const form = document.getElementById('form');
+const input = document.getElementById('q');
+const button = document.getElementById('send');
+const voiceBox = document.getElementById('voice');
+const overlay = new URLSearchParams(location.search).has('overlay');
+if (overlay) document.body.classList.add('overlay');
+const qInput = overlay ? document.getElementById('oq') : input;
+const overlayReply = document.getElementById('overlayReply');
+const overlaySend = document.getElementById('osend');
+const BASE = '/avatar-assets/characters/mingyue-q/anim/';
+const states = ['idle','thinking','talking','happy','shy','angry','sad','surprised','confused','sleepy','proud','hungry','wave','jump'];
+const LABEL = {idle:'待机',thinking:'思考',talking:'说话',happy:'开心',shy:'害羞',angry:'生气',sad:'难过',surprised:'惊讶',confused:'困惑',sleepy:'困困',proud:'得意',hungry:'馋嘴',wave:'挥手',jump:'蹦跳'};
+let current = 'idle', idleTimer = null, busy = false;
+function setState(name, label) {
+  if (!states.includes(name)) name = 'idle';
+  current = name;
+  pet.src = BASE + name + '.webp';
+  status.textContent = label || LABEL[name] || name;
+}
+function scheduleIdle() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (busy) return scheduleIdle();
+    const pool = ['wave','happy','shy','sleepy','thinking','idle','idle'];
+    setState(pool[Math.floor(Math.random()*pool.length)]);
+    setTimeout(() => { if (!busy) setState('idle'); scheduleIdle(); }, 2600 + Math.random()*2600);
+  }, 5000 + Math.random()*5000);
+}
+function add(who, text) {
+  if (overlay) {
+    overlayReply.textContent = (who === 'me' ? '你：' : '') + text;
+    return null;
+  }
+  const row = document.createElement('div');
+  row.className = 'msg ' + who;
+  row.textContent = text;
+  log.appendChild(row); log.scrollTop = log.scrollHeight;
+  return row;
+}
+function speak(text) {
+  if (!voiceBox.checked || !window.speechSynthesis) return;
+  try { const u = new SpeechSynthesisUtterance(text); u.lang = 'zh-CN'; u.rate = 1.02;
+        speechSynthesis.cancel(); speechSynthesis.speak(u); } catch (e) {}
+}
+function emotionOf(text) {
+  if (/哼|生气|不理你|炸毛/.test(text)) return 'angry';
+  if (/呜|难过|委屈|想哭/.test(text)) return 'sad';
+  if (/别|害羞|才没有/.test(text)) return 'shy';
+  if (/！|欸|真的吗|吓/.test(text)) return 'surprised';
+  if (/困|睡|哈欠/.test(text)) return 'sleepy';
+  if (/嘿嘿|开心|厉害|好耶/.test(text)) return 'happy';
+  return 'talking';
+}
+async function send() {
+  const text = qInput.value.trim(); if (!text || busy) return;
+  qInput.value = ''; busy = true; button.disabled = true;
+  setState('thinking'); add('me', text);
+  const typing = add('her', '唔……本鲸想想。');
+  try {
+    const resp = await fetch('/v1/chat/completions', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({model:'dfy-companion', messages:[{role:'user', content:text}]})});
+    const data = await resp.json();
+    const reply = (data && data.choices && data.choices[0] && data.choices[0].message)
+      ? data.choices[0].message.content : '呜……本鲸刚刚走神了。';
+    if (typing) typing.remove(); add('her', reply); speak(reply);
+    setState(emotionOf(reply));
+    setTimeout(() => { setState('idle'); busy = false; button.disabled = false; if (!overlay) input.focus(); else qInput.focus(); scheduleIdle(); }, 2400);
+  } catch (err) {
+    if (typing) typing.remove(); add('her', '呜……接口没连上：' + err); setState('sad');
+    setTimeout(() => { setState('idle'); busy = false; button.disabled = false; }, 2000);
+  }
+}
+form.addEventListener('submit', e => { e.preventDefault(); send(); });
+if (overlaySend) overlaySend.addEventListener('click', e => { e.preventDefault(); send(); });
+if (overlay) qInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); send(); } });
+scheduleIdle();
+</script>
+</body>
+</html>
+"""
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -154,6 +340,27 @@ class _Handler(BaseHTTPRequestHandler):
         if path in ("/", "/chat"):
             name = getattr(self.server, "display_name", "") or "大肥鱼"
             self._send_html(200, CHAT_HTML.replace("{{NAME}}", name))
+        elif path in ("/avatar", "/2d"):
+            name = getattr(self.server, "display_name", "") or "小鲸鱼"
+            self._send_html(200, AVATAR_HTML.replace("{{NAME}}", name))
+        elif path.startswith("/avatar-assets/"):
+            rel = path[len("/avatar-assets/"):]
+            target = (ASSET_ROOT / rel).resolve()
+            root = ASSET_ROOT.resolve()
+            if not str(target).startswith(str(root) + os.sep) or target.suffix.lower() not in (".webp", ".png", ".gif"):
+                self.send_response(404); self.end_headers(); return
+            if not target.is_file():
+                self.send_response(404); self.end_headers(); return
+            data = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", mimetypes.guess_type(str(target))[0] or "application/octet-stream")
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except Exception:
+                pass
         elif path in ("/health", "/v1/health"):
             self._send_json(200, {"ok": True, "service": "dfy-shared-brain",
                                   "time": int(time.time())})
@@ -186,10 +393,12 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._send_json(401, {"error": {"message": "invalid token", "type": "auth_error"}})
             return
-        if self.path.rstrip("/") in ("/v1/messages", "/anthropic/v1/messages"):
+        # 比路径时去掉 ?查询参数：Anthropic SDK（DSH 自定义模型 API 用它）会请求 /v1/messages?beta=true
+        route = self.path.split("?", 1)[0].rstrip("/")
+        if route in ("/v1/messages", "/anthropic/v1/messages"):
             self._anthropic_messages()  # DSH 0.2.x 的 DeepSeek 路由走 Anthropic Messages 格式
             return
-        if self.path.rstrip("/") == "/v1/pet/event":  # 3D 身体被点了：摸头等
+        if route == "/v1/pet/event":  # 3D 身体被点了：摸头等
             handler = getattr(self.server, "pet_event", None)
             try:
                 length = min(int(self.headers.get("Content-Length") or 0), 4096)
@@ -200,7 +409,7 @@ class _Handler(BaseHTTPRequestHandler):
             ok = bool(kind) and callable(handler) and bool(handler(kind))
             self._send_json(200 if ok else 400, {"ok": ok})
             return
-        if self.path.rstrip("/") != "/v1/chat/completions":
+        if route != "/v1/chat/completions":
             self._send_json(404, {"error": {"message": "not found", "type": "not_found"}})
             return
         try:
@@ -212,20 +421,26 @@ class _Handler(BaseHTTPRequestHandler):
             return
         messages = payload.get("messages") or []
         user_text = ""
+        raw_text = ""
         for item in reversed(messages if isinstance(messages, list) else []):
             if isinstance(item, dict) and item.get("role") == "user":
                 content = item.get("content")
                 if isinstance(content, list):
                     content = " ".join(str(part.get("text", "")) for part in content
                                        if isinstance(part, dict))
-                if content:
-                    user_text = str(content).strip()
+                raw_text = raw_text or str(content or "")
+                cleaned = clean_user_text(content)
+                if cleaned:
+                    user_text = cleaned
                     break
         brain = getattr(self.server, "brain", None)
         compact = self.headers.get("x-deepseek-harness-compact") == "1"
+        title = title_request(raw_text)
         if compact:
             # DSH 对话太长时让模型总结前文：这不是在跟她聊天，直接摘抄，不调模型、不进她的记忆
             reply, source = compact_summary(messages), "compact"
+        elif title is not None:
+            reply, source = title, "title"
         elif not user_text or brain is None:
             reply, source = "（没有收到要回答的内容）", "error"
         else:
@@ -269,31 +484,41 @@ class _Handler(BaseHTTPRequestHandler):
             return
         messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
         user_text = ""
+        raw_text = ""
         for item in reversed(messages):
             if isinstance(item, dict) and item.get("role") == "user":
                 content = item.get("content")
                 if isinstance(content, list):  # 内容块：只要文字，工具结果之类跳过
                     content = " ".join(str(b.get("text", "")) for b in content
                                        if isinstance(b, dict) and b.get("type") == "text")
-                if str(content or "").strip():
-                    user_text = str(content).strip()
+                raw_text = raw_text or str(content or "")
+                cleaned = clean_user_text(content)  # DSH 会把 <system-reminder> 工作区说明塞进用户消息
+                if cleaned:
+                    user_text = cleaned
                     break
         brain = getattr(self.server, "brain", None)
+        title = title_request(raw_text)
         if self.headers.get("x-deepseek-harness-compact") == "1":
             reply, source = compact_summary(messages), "compact"
+        elif title is not None:  # 起会话标题：不交给她、不进她的记忆
+            reply, source = title, "title"
         elif not user_text or brain is None:
             reply, source = "（没有收到要回答的内容）", "error"
         else:
             try:
+                brain.take_usage()
                 reply, source = brain.reply(user_text)
             except Exception as exc:
                 reply, source = f"她这边出了点问题：{exc}", "error"
+        used = brain.take_usage() if brain is not None and hasattr(brain, "take_usage") else {}
         log = getattr(self.server, "brain_log", None)
         if callable(log):
             log(f"共享大脑请求（DSH/Messages）：{user_text[:60]} → {source}（{len(reply)} 字）")
         reply = reply or "……"
         message_id = f"msg_dfy_{int(time.time() * 1000)}"
-        usage = {"input_tokens": 0, "output_tokens": 0}
+        hit = int(used.get("prompt_cache_hit_tokens", 0))
+        usage = {"input_tokens": max(0, int(used.get("prompt_tokens", 0)) - hit), "cache_read_input_tokens": hit,
+                 "output_tokens": int(used.get("completion_tokens", 0))}
         if not payload.get("stream"):
             self._send_json(200, {"id": message_id, "type": "message", "role": "assistant", "model": "dfy-companion",
                                   "content": [{"type": "text", "text": reply}], "stop_reason": "end_turn",
@@ -319,7 +544,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "type": "text_delta", "text": reply[start:start + 12]}}))
             self.wfile.write(event("content_block_stop", {"index": 0}))
             self.wfile.write(event("message_delta", {"delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                                                     "usage": {"output_tokens": 0}}))
+                                                     "usage": {"output_tokens": usage["output_tokens"]}}))
             self.wfile.write(event("message_stop", {}))
             self.wfile.flush()
         except Exception:

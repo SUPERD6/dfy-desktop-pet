@@ -17,6 +17,8 @@ import shutil
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 try:  # edge-tts 是可选依赖：没装也能播放预合成语音
@@ -157,7 +159,9 @@ class VoiceEngine:
         if not raw:
             return
         # 原文先试一次预合成（台词本身可能带「~」），没命中再念清洗后的文本
-        if raw in self._preset_by_text or normalize(raw) in self._preset_by_norm:
+        # GPT-SoVITS 模式下跳过旧晓伊预合成，否则常说的话仍是旧声音
+        use_presets = str(self.config.get("voice_backend") or "edge").lower() != "gptsovits"
+        if use_presets and (raw in self._preset_by_text or normalize(raw) in self._preset_by_norm):
             self._queue.put(("text", raw))
             return
         spoken = trim_for_speech(clean_for_speech(raw), int(self.config.get("voice_max_chars") or 90))
@@ -194,15 +198,17 @@ class VoiceEngine:
                     self._play(Path(payload))
                 elif kind == "text":
                     text = str(payload)
-                    preset = self._preset_by_text.get(text) or self._preset_by_norm.get(normalize(text))
+                    preset = None
+                    if str(self.config.get("voice_backend") or "edge").lower() != "gptsovits":
+                        preset = self._preset_by_text.get(text) or self._preset_by_norm.get(normalize(text))
                     if preset is not None:
                         self._play(preset)
-                    elif HAS_EDGE_TTS:
+                    else:
                         path = self._synthesize(text)
                         if path is not None:
                             self._play(path)
-                    else:
-                        self.log("voice: 没有 edge-tts，这一句只能显示文字")
+                        else:
+                            self.log("voice: 这一句没有合成成功，只能显示文字")
                 elif kind == "stop":
                     pass  # 播放是同步的，队列里的 stop 只影响后续
             except Exception as exc:  # 播放失败不能把桌宠弄崩
@@ -211,6 +217,68 @@ class VoiceEngine:
                 self._queue.task_done()
 
     def _synthesize(self, text: str) -> Path | None:
+        backend = str(self.config.get("voice_backend") or "edge").strip().lower()
+        if backend in ("gptsovits", "gpt-sovits", "so-vits"):
+            path = self._synthesize_gptsovits(text)
+            if path is not None:
+                return path
+            self.log("voice: GPT-SoVITS 不可用，回退 edge-tts")
+        return self._synthesize_edge(text)
+
+    def _synthesize_gptsovits(self, text: str) -> Path | None:
+        cfg = self.config.get("gptsovits") or {}
+        if not isinstance(cfg, dict):
+            return None
+        base_url = str(cfg.get("base_url") or "http://127.0.0.1:9880").rstrip("/")
+        ref = str(cfg.get("ref_audio_path") or "").strip()
+        if not ref:
+            return None
+        ref_path = Path(ref)
+        if not ref_path.is_absolute():
+            ref_path = (self.assets.parent / ref_path).resolve()
+        if not ref_path.is_file():
+            self.log(f"voice: GPT-SoVITS 参考音频不存在：{ref_path}")
+            return None
+        prompt = str(cfg.get("prompt_text") or "")
+        if not prompt:
+            self.log("voice: GPT-SoVITS 缺少参考文字 prompt_text")
+            return None
+        ref_key = hashlib.sha1(ref_path.read_bytes()[:4096]).hexdigest()[:10]
+        key = hashlib.sha1(f"gs|{ref_key}|{prompt}|{text}".encode("utf-8")).hexdigest()
+        out = self.cache / f"tts_gs_{key}.wav"
+        if out.exists() and out.stat().st_size > 1024:
+            return out
+        params = {
+            "text": text,
+            "text_lang": str(cfg.get("text_lang") or "zh"),
+            "ref_audio_path": str(ref_path),
+            "prompt_text": prompt,
+            "prompt_lang": str(cfg.get("prompt_lang") or "zh"),
+            "text_split_method": str(cfg.get("text_split_method") or "cut5"),
+            "batch_size": "1",
+            "media_type": "wav",
+            "streaming_mode": "false",
+        }
+        url = base_url + "/tts?" + urllib.parse.urlencode(params)
+        tmp = out.with_suffix(".part")
+        try:
+            with urllib.request.urlopen(url, timeout=120) as response:
+                body = response.read()
+            if len(body) > 1024:
+                tmp.write_bytes(body)
+                tmp.replace(out)
+                return out
+        except Exception as exc:
+            self.log(f"voice: GPT-SoVITS 合成失败：{exc}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+
+    def _synthesize_edge(self, text: str) -> Path | None:
+        if not HAS_EDGE_TTS:
+            return None
         voice = self.config.get("voice") or "zh-CN-XiaoyiNeural"
         rate = str(self.config.get("voice_rate") or "-4%")
         pitch = str(self.config.get("voice_pitch") or "+6Hz")
@@ -274,7 +342,8 @@ class VoiceEngine:
                     pass
 
     def _open_and_play(self, alias: str, path: Path) -> None:
-        self._send_mci(f'open "{path}" type mpegvideo alias {alias}')
+        mci_type = "waveaudio" if path.suffix.lower() == ".wav" else "mpegvideo"
+        self._send_mci(f'open "{path}" type {mci_type} alias {alias}')
         try:
             try:
                 vol = int(self.config.get("volume", 800))

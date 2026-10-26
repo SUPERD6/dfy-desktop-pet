@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import random
 import re
 import sys
@@ -25,10 +26,51 @@ from pathlib import Path
 from tkinter import font as tkfont
 
 from PIL import Image, ImageDraw, ImageTk
-from interactions import (DRAG_LINES, FEED_LINES, INNER_VOICE_LINES, render_food,
-                          state_for_actions, step_flight)
+from interactions import (DRAG_LINES, FEED_LINES, INNER_VOICE_LINES, pat_event,
+                          pat_fallbacks, render_food, state_for_actions, step_flight)
+from touch_zones import (BODY_MAP_HINT, touch_emotion, touch_event, touch_fallbacks,
+                         touch_point_event, zone_for)
+from desktop_integration import (TrayService, autostart_enabled, clamp_opacity,
+                                 click_through, set_autostart, tray_available)
+from hotkeys import HotkeyService, hotkey_labels
+from screen_awareness import (capture_screen, cleanup_screens, context_line,
+                              screen_context, vision_copy)
+from self_space import home_root, save_note, write_home_text
+from news import fetch_headlines, headlines_text
+from vision_model import describe_image as describe_screen_image, resolve_vision
+from claude_vision import claude_see
+from video_gen import create_task as create_video_task, download as download_video
+from video_gen import resolve_key as resolve_ark_key, wait_task as wait_video_task
+from video_understanding import describe_video
+try:
+    from netease_music import download as netease_download, search as netease_search
+except Exception:
+    netease_download = netease_search = None
+try:
+    from itunes_control import now_playing as itunes_now_playing
+    from itunes_control import next_track as itunes_next, play_pause as itunes_play_pause
+    from itunes_control import play_first as itunes_play_first, previous as itunes_previous
+    from itunes_control import search_play as itunes_search_play, stop as itunes_stop
+except Exception:  # iTunes 不是必需依赖
+    itunes_now_playing = itunes_next = itunes_play_pause = None
+    itunes_play_first = itunes_previous = itunes_search_play = itunes_stop = None
+try:
+    from seed_vc_sing import available as seedvc_available, convert as seedvc_convert
+except Exception:
+    seedvc_available = lambda: False
+    seedvc_convert = None
+try:
+    from music_source import pick_source as pick_music_source
+except Exception:
+    pick_music_source = None
 from memory import format_time
+from sfx import Sfx
 from stickers import StickerBook
+from singing import Songbook
+try:
+    from douyin_bridge import DouyinBridge
+except Exception:  # 桥可选：缺文件时不影响桌宠
+    DouyinBridge = None
 
 CHOMP_SOUNDS = ("啊呜～咔嚓咔嚓。", "嗷呜，吧唧吧唧……", "咔嚓咔嚓，好吃！")
 # 心情标记里的情绪 → 动画状态
@@ -76,6 +118,7 @@ PARTICLE_SPECS = {
     "hungry": (("○",), "#d79a5b"),
     "jump": (("✦", "♥"), "#e8b447"),
     "wave": (("♪",), "#8fb4ea"),
+    "bubbles": (("○", "◦", "°"), "#8fc3f0"),  # 入场时冒的泡泡
 }
 # 让她表演时的台词
 EMOTION_LINES = {
@@ -367,6 +410,10 @@ class Animator:
         self.canvas_width = canvas_width
         self.canvas_height = canvas_height
         self._cache: dict[str, list[tuple[ImageTk.PhotoImage, int]]] = {}
+        self._pil: dict[str, list[Image.Image]] = {}  # 缩放好的原图，压扁/回弹时现做变形帧
+        self._squash = (1.0, 1.0)
+        self._squash_photo = None
+        self._spring_after = None
         self._state: str | None = None
         self._index = 0
         self._after_id = None
@@ -414,6 +461,7 @@ class Animator:
         if key in self._cache:
             return self._cache[key]
         out: list[tuple[ImageTk.PhotoImage, int]] = []
+        pils: list[Image.Image] = []
         for image, duration in self.library.states[state]:
             width, height = image.size
             scale = self.target_width / float(width) if width else 1.0
@@ -426,7 +474,9 @@ class Animator:
             if flip:
                 resized = resized.transpose(Image.FLIP_LEFT_RIGHT)
             out.append((ImageTk.PhotoImage(resized), duration))
+            pils.append(resized)
         self._cache[key] = out
+        self._pil[key] = pils
         return out
 
     def _tick(self) -> None:
@@ -436,7 +486,7 @@ class Animator:
         if not frames:
             return
         image, duration = frames[self._index % len(frames)]
-        self.canvas.itemconfigure(self.item, image=image)
+        self.canvas.itemconfigure(self.item, image=self._squashed(self._index) or image)
         self.canvas.tag_raise(self.item)
         self._index += 1
         finished = self._index >= len(frames)
@@ -446,6 +496,53 @@ class Animator:
             self.play(follow)
             return
         self._after_id = self.root.after(duration, self._tick)
+
+    # ---------- 按压 Q 弹（借鉴 DSH 小鲸鱼挂件：按下去压扁，松手弹回，脚底不动） ----------
+    def _squashed(self, index: int):
+        sx, sy = self._squash
+        if abs(sx - 1) < 0.005 and abs(sy - 1) < 0.005 or not self._state:
+            return None
+        flip = bool(getattr(self, "facing_left", False)) and self._state in self.SIDE_STATES
+        pils = self._pil.get(f"{self._state}|flip" if flip else self._state) or []
+        if not pils:
+            return None
+        base = pils[index % len(pils)]
+        size = (max(1, int(base.width * sx)), max(1, int(base.height * sy)))
+        self._squash_photo = ImageTk.PhotoImage(base.resize(size, Image.BILINEAR))
+        return self._squash_photo
+
+    def _redraw(self) -> None:
+        if not self._state:
+            return
+        frames = self._frames(self._state)
+        if frames:
+            index = max(0, self._index - 1)
+            self.canvas.itemconfigure(self.item, image=self._squashed(index) or frames[index % len(frames)][0])
+
+    def press(self) -> None:
+        self._cancel_spring()
+        self._squash = (1.1, 0.86)
+        self._redraw()
+
+    def release(self) -> None:
+        """松手：沿 1.08 → 0.95 → 1.03 → 1 回弹两下。"""
+        self._cancel_spring()
+        steps = [(0.95, 1.08), (1.04, 0.95), (0.99, 1.03), (1.0, 1.0)]
+
+        def step(i: int) -> None:
+            self._squash = steps[i]
+            self._redraw()
+            self._spring_after = self.root.after(60, step, i + 1) if i + 1 < len(steps) else None
+
+        step(0)
+
+    def _cancel_spring(self) -> None:
+        if self._spring_after is not None:
+            try:
+                self.root.after_cancel(self._spring_after)
+            except Exception:
+                pass
+            self._spring_after = None
 
     # ---------- 说话动画（模拟口型） ----------
     def set_talking(self, talking: bool) -> None:
@@ -759,6 +856,10 @@ class ChatWindow(tk.Toplevel):
         except Exception:
             pass
         self._listening = False
+        self.conversation_mode = False
+        self._conv_job = None
+        self._barge_job = None
+        self._barge_reply = ""
 
         header = tk.Frame(self, bg="#eef3ff")
         header.pack(fill="x", padx=10, pady=(8, 2))
@@ -791,6 +892,10 @@ class ChatWindow(tk.Toplevel):
                                     bg="#dce7ff", fg="#24468f", relief="flat",
                                     font=("Microsoft YaHei", 9), padx=8)
         self.mic_button.pack(side="left", padx=(6, 0))
+        self.conv_button = tk.Button(bottom, text="🔁 连续对话", command=self.toggle_conversation,
+                                     bg="#eef7e6", fg="#3f6b2a", relief="flat",
+                                     font=("Microsoft YaHei", 9), padx=8)
+        self.conv_button.pack(side="left", padx=(6, 0))
         tk.Button(bottom, text="发送", command=self.send, bg="#4a7cf0", fg="#ffffff",
                   relief="flat", font=("Microsoft YaHei", 9, "bold"), padx=10).pack(side="left", padx=(6, 0))
 
@@ -846,12 +951,128 @@ class ChatWindow(tk.Toplevel):
             self.status_label.configure(text="离线台词模式（模型调用失败）")
         else:
             self.status_label.configure(text=self.app.brain.status_text())
+        if self.conversation_mode:
+            self._barge_reply = reply or ""
+            self._schedule_barge_listen(350)
+
+    def _cancel_barge_job(self) -> None:
+        if self._barge_job is not None:
+            try:
+                self.after_cancel(self._barge_job)
+            except Exception:
+                pass
+            self._barge_job = None
+
+    def _schedule_barge_listen(self, delay: int = 500) -> None:
+        if not self.conversation_mode:
+            return
+        self._cancel_barge_job()
+        self._barge_job = self.after(delay, self._barge_listen)
+
+    @staticmethod
+    def _is_self_echo(text: str, reply: str) -> bool:
+        import difflib
+        import re as _re
+
+        clean = lambda s: _re.sub(r"[\s，。！？、；：…,.!?;:~～~（）()\[\]【】\"'“”‘’]+", "", s or "")
+        heard, said = clean(text), clean(reply)
+        if len(heard) < 2:
+            return True
+        if not said:
+            return False
+        if heard in said or said in heard:
+            return True
+        return difflib.SequenceMatcher(None, heard, said).ratio() >= 0.45
+
+    def _barge_listen(self) -> None:
+        self._barge_job = None
+        if not self.conversation_mode:
+            return
+        if not self.app.voice.busy():
+            self._schedule_conversation_listen(300)
+            return
+        if not self.app.config.get("barge_in_enabled", True):
+            self._schedule_barge_listen(600)
+            return
+        if self._listening:
+            self._schedule_barge_listen(450)
+            return
+        self._listening = True
+        self.mic_button.configure(text="👂 可打断")
+
+        def done(text, error):
+            try:
+                self.after(0, self._on_barge_done, text, error)
+            except Exception:
+                pass
+
+        self.app.asr.listen(done, timeout=2.0, phrase_limit=4.0)
+
+    def _on_barge_done(self, text, error) -> None:
+        self._listening = False
+        self.mic_button.configure(text="🎤 说话")
+        if not self.conversation_mode:
+            return
+        if text and not self._is_self_echo(str(text), self._barge_reply):
+            self.app.voice.stop()
+            self.append("sys", "系统", "（你打断了她）")
+            self.entry.delete(0, "end")
+            self.entry.insert(0, str(text))
+            self.send()
+            return
+        if self.app.voice.busy():
+            self._schedule_barge_listen(650)
+        else:
+            self._schedule_conversation_listen(300)
+
+    def toggle_conversation(self) -> None:
+        """连续对话：她说完后自动再听，不用每句点一次麦克风。"""
+        self.conversation_mode = not self.conversation_mode
+        if self.conversation_mode:
+            self.conv_button.configure(text="⏹ 结束连续")
+            self.append("sys", "系统", "连续对话开了：说完一句，她回完会自动继续听。再点一次结束。")
+            self._schedule_conversation_listen(300)
+        else:
+            self.conv_button.configure(text="🔁 连续对话")
+            self._cancel_conversation_job()
+            self._cancel_barge_job()
+            self.append("sys", "系统", "连续对话结束。")
+
+    def _cancel_conversation_job(self) -> None:
+        if self._conv_job is not None:
+            try:
+                self.after_cancel(self._conv_job)
+            except Exception:
+                pass
+            self._conv_job = None
+
+    def _schedule_conversation_listen(self, delay: int = 600) -> None:
+        if not self.conversation_mode:
+            return
+        self._cancel_conversation_job()
+        self._conv_job = self.after(delay, self._conversation_listen)
+
+    def _conversation_listen(self) -> None:
+        self._conv_job = None
+        if not self.conversation_mode:
+            return
+        if self.app.voice.busy():
+            self._schedule_conversation_listen(450)
+            return
+        if self._listening:
+            self._schedule_conversation_listen(450)
+            return
+        self.toggle_mic()
 
     def toggle_mic(self) -> None:
         if self._listening:
             self._listening = False
             self.mic_button.configure(text="🎤 说话")
             return
+        if self.app.voice.busy():
+            # 她一开口念，点麦克风就是打断，不再等整段念完
+            self.app.voice.stop()
+            self.append("sys", "系统", "（打断她）")
         if not self.app.asr.ok:
             self.append("sys", "系统", "语音输入不可用：" + self.app.asr.reason)
             return
@@ -870,13 +1091,32 @@ class ChatWindow(tk.Toplevel):
         self.mic_button.configure(text="🎤 说话")
         self.app.set_state("idle")
         if text:
-            self.append("me", "你（语音）", text)
-            self.send(text)
+            self.entry.delete(0, "end")
+            self.entry.insert(0, str(text))
+            if self.conversation_mode:
+                # 连续对话模式：识别到就发，不再要求每句确认；回复完再自动听
+                self.send()
+                return
+            self.entry.focus_set()
+            self.append("sys", "系统", "语音识别结果已填入，确认/修改后按发送。")
+            if self.app.config.get("voice_auto_send"):
+                self.send()
         else:
-            self.append("sys", "系统", "没听清：" + (error or "再试一次吧。"))
+            reason = str(error or "再试一次吧。")
+            self.append("sys", "系统", "没听清：" + reason)
             self.status_label.configure(text=self.app.brain.status_text())
+            if self.conversation_mode:
+                self._schedule_conversation_listen(1500)
+            else:
+                self.app.bubble.show("没听清，再说一遍好不好？", 3200)
+                try:
+                    self.app.voice.speak("没听清，再说一遍好不好？")
+                except Exception:
+                    pass
 
     def close(self) -> None:
+        self._cancel_conversation_job()
+        self._cancel_barge_job()
         self.app.chat_window = None
         self.destroy()
 
@@ -897,6 +1137,7 @@ class QuickChat(tk.Toplevel):
         self._drag = None
         self._history: list[tuple[str, str]] = []
         self._side = "right"
+        self._listening = False
         outer = tk.Frame(self, bg="#ffffff", highlightbackground="#a9c3f2", highlightthickness=2)
         outer.pack(fill="both", expand=True, padx=3, pady=3)
 
@@ -940,6 +1181,11 @@ class QuickChat(tk.Toplevel):
                               highlightbackground="#c9d9f7", highlightthickness=1)
         self.entry.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
         self.entry.bind("<Return>", lambda event: self.send())
+        self.mic_button = tk.Button(row, text="🎤", command=self.toggle_mic,
+                                    bg="#dce7ff", fg="#24468f", activebackground="#c9d9f7",
+                                    relief="flat", cursor="hand2",
+                                    font=("Microsoft YaHei", 10), padx=6)
+        self.mic_button.pack(side="left", padx=(0, 5))
         tk.Button(row, text="发送", command=self.send, bg="#4a7cf0", fg="#ffffff",
                   activebackground="#3b6be0", relief="flat", cursor="hand2",
                   font=("Microsoft YaHei", 9, "bold"), padx=10).pack(side="left")
@@ -1036,6 +1282,51 @@ class QuickChat(tk.Toplevel):
         if source == "agent":
             self.append("sys", "系统", "（用了工具）")
         self.append("her", "大肥鱼", (reply or "").strip() or "……")
+
+    def toggle_mic(self) -> None:
+        """快捷聊天条里的语音输入：识别后填进输入框并直接发送。"""
+        if self._listening:
+            self._listening = False
+            self.mic_button.configure(text="🎤")
+            return
+        if not self.app.asr.ok:
+            self.append("sys", "系统", "语音输入不可用：" + str(self.app.asr.reason))
+            return
+        self._listening = True
+        self.mic_button.configure(text="👂")
+        self.append("sys", "系统", "正在听…（最多 8 秒）")
+        self.app.set_state("waiting")
+
+        def done(text, error):
+            try:
+                self.after(0, self._on_asr_done, text, error)
+            except Exception:
+                pass
+
+        self.app.asr.listen(done)
+
+    def _on_asr_done(self, text, error) -> None:
+        self._listening = False
+        try:
+            self.mic_button.configure(text="🎤")
+        except Exception:
+            pass
+        self.app.set_state("idle")
+        if text:
+            self.entry.delete(0, "end")
+            self.entry.insert(0, str(text))
+            self.entry.focus_set()
+            self.append("sys", "系统", "语音识别好了，确认/修改后按发送。")
+            if self.app.config.get("voice_auto_send"):
+                self.send()
+        else:
+            reason = str(error or "再试一次吧。")
+            self.append("sys", "系统", "没听清：" + reason)
+            self.app.bubble.show("没听清，再说一遍好不好？", 3200)
+            try:
+                self.app.voice.speak("没听清，再说一遍好不好？")
+            except Exception:
+                pass
 
     def close(self) -> None:
         self.app.quick_chat = None
@@ -1336,6 +1627,83 @@ class SettingsWindow(tk.Toplevel):
         self.destroy()
 
 
+# --------------------------------------------------------------------------- 启动画面
+class Splash:
+    """启动时先弹的小卡片：她的头像 +「正在醒来」+ 进度，把加载素材的几秒填上。"""
+
+    def __init__(self, root: tk.Tk, name: str, avatar: Path | None):
+        self.root = root
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)
+        try:
+            self.win.attributes("-topmost", True)
+            self.win.attributes("-alpha", 0.0)
+        except Exception:
+            pass
+        frame = tk.Frame(self.win, bg="#ffffff", highlightbackground="#a9c3f2", highlightthickness=2)
+        frame.pack()
+        self._photo = None
+        if avatar is not None:
+            try:
+                image = Image.open(avatar)
+                image.seek(0)
+                image = image.convert("RGBA")
+                box = image.getchannel("A").getbbox()
+                if box:
+                    image = image.crop(box)
+                image.thumbnail((180, 200), Image.LANCZOS)
+                card = Image.new("RGBA", image.size, (255, 255, 255, 255))
+                card.paste(image, (0, 0), image)
+                self._photo = ImageTk.PhotoImage(card)
+                tk.Label(frame, image=self._photo, bg="#ffffff").pack(padx=24, pady=(18, 6))
+            except Exception:
+                self._photo = None
+        tk.Label(frame, text=f"{name} 正在醒来", bg="#ffffff", fg="#1d3f86",
+                 font=("Microsoft YaHei", 13, "bold")).pack(padx=24)
+        self.stage_var = tk.StringVar(value="伸个懒腰……")
+        tk.Label(frame, textvariable=self.stage_var, bg="#ffffff", fg="#7a88aa",
+                 font=("Microsoft YaHei", 9)).pack(padx=24, pady=(2, 16))
+        self.win.update_idletasks()
+        w, h = self.win.winfo_width(), self.win.winfo_height()
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self.win.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2 - 40}")
+        for step in range(1, 6):  # 淡入
+            self._alpha(step / 5)
+        self.stage("伸个懒腰……")
+
+    def _alpha(self, value: float) -> None:
+        try:
+            self.win.attributes("-alpha", value)
+            self.win.update()
+        except Exception:
+            pass
+
+    def stage(self, text: str) -> None:
+        """加载到哪一步了（init 是同步的，所以每步手动刷新一下界面）。"""
+        try:
+            self.stage_var.set(text)
+            self.win.update()
+        except Exception:
+            pass
+
+    def close(self, then=None) -> None:
+        def fade(step: int) -> None:
+            if step <= 0:
+                try:
+                    self.win.destroy()
+                except Exception:
+                    pass
+                if then:
+                    then()
+                return
+            try:
+                self.win.attributes("-alpha", step / 6)
+            except Exception:
+                pass
+            self.root.after(35, fade, step - 1)
+        fade(6)
+
+
 # --------------------------------------------------------------------------- 记忆窗口
 class MemoryWindow(tk.Toplevel):
     """看她记得什么：事实（可删/调重要度）、日记、心情、最近一次召回、饭量、提醒。"""
@@ -1478,6 +1846,99 @@ class MemoryWindow(tk.Toplevel):
 
 
 # --------------------------------------------------------------------------- 主程序
+class NestWindow(tk.Toplevel):
+    """她的小窝：桌面上的房间；东西存在 pet/home/nest.json，她可以自己添。"""
+
+    W, H = 580, 460
+    CATALOG = ("🍙 白饭", "🐟 小鱼干", "🍉 西瓜", "📚 书", "🧸 玩偶", "⭐ 星星灯",
+               "🪴 小盆栽", "🎀 蝴蝶结", "🕯️ 蜡烛", "💎 亮晶晶", "🎮 小游戏机", "🧺 篮子")
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("小鲸鱼的小窝")
+        self.resizable(False, False)
+        self.configure(bg="#f7ead8")
+        self.geometry(f"{self.W}x{self.H}+{max(60, app.root.winfo_x() - 120)}+{max(60, app.root.winfo_y() - 260)}")
+        self._photo = None
+        self.items = self._load()
+        self.canvas = tk.Canvas(self, width=self.W, height=self.H - 46, bg="#f7ead8", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        bar = tk.Frame(self, bg="#f7ead8")
+        bar.pack(fill="x", pady=(0, 8))
+        tk.Button(bar, text="让她自己添一件", command=self.app.build_nest).pack(side="left", padx=10)
+        tk.Button(bar, text="放点东西…", command=self.app.add_nest_item).pack(side="left")
+        tk.Button(bar, text="关门", command=self.destroy).pack(side="right", padx=10)
+        self.draw()
+
+    def _path(self):
+        return home_root(BASE) / "nest.json"
+
+    def _load(self) -> list:
+        try:
+            data = json.loads(self._path().read_text(encoding="utf-8"))
+            items = data.get("items") if isinstance(data, dict) else None
+            cleaned = [str(item)[:24] for item in (items or []) if str(item).strip()]
+            return cleaned[:18] or list(self.CATALOG[:6])
+        except Exception:
+            return list(self.CATALOG[:6])
+
+    def save(self) -> None:
+        try:
+            write_home_text(home_root(BASE), "nest.json",
+                            json.dumps({"items": self.items}, ensure_ascii=False, indent=1))
+        except Exception:
+            pass
+
+    def add_item(self, label: str) -> None:
+        label = str(label or "").strip()[:24]
+        if label and label not in self.items and len(self.items) < 18:
+            self.items.append(label)
+            self.save()
+            self.draw()
+
+    def draw(self) -> None:
+        c = self.canvas
+        c.delete("all")
+        # 墙/地
+        for i in range(0, self.H, 8):
+            color = "#fbefe0" if i < 300 else "#efd7b8"
+            c.create_rectangle(0, i, self.W, i + 8, fill=color, outline="")
+        c.create_rectangle(0, 300, self.W, self.H, fill="#e8c9a5", outline="")
+        c.create_rectangle(0, 300, self.W, 306, fill="#d8ae84", outline="")
+        # 窗和月光
+        c.create_rectangle(46, 56, 196, 206, fill="#cfe4ff", outline="#8aa9cf", width=3)
+        c.create_line(121, 56, 121, 206, fill="#8aa9cf", width=2)
+        c.create_line(46, 131, 196, 131, fill="#8aa9cf", width=2)
+        c.create_oval(146, 74, 176, 104, fill="#fff4c8", outline="")
+        c.create_text(121, 34, text="她的窗", fill="#7b6654", font=("Microsoft YaHei", 10))
+        # 架子
+        c.create_rectangle(410, 92, 548, 102, fill="#b98c61", outline="")
+        for i, label in enumerate(self.items[:6]):
+            c.create_text(430 + (i % 3) * 44, 78, text=label.split(" ")[0],
+                          font=("Segoe UI Emoji", 18))
+        # 地毯与窝
+        c.create_oval(70, 356, 510, 442, fill="#d9a77d", outline="#b5825c", width=2)
+        c.create_oval(150, 320, 430, 420, fill="#f4d7a8", outline="#c89a68", width=3)
+        c.create_oval(176, 338, 404, 398, fill="#ffe9c4", outline="")
+        # 她的立绘
+        try:
+            frames = getattr(self.app.library, "states", {}).get("idle") or []
+            if frames:
+                image = frames[0][0]
+                image = image.resize((180, int(180 * image.height / max(1, image.width))), Image.LANCZOS)
+                self._photo = ImageTk.PhotoImage(image)
+                c.create_image(290, 378, anchor="s", image=self._photo)
+        except Exception:
+            c.create_text(290, 360, text="🐳", font=("Segoe UI Emoji", 64))
+        # 地面小物
+        for i, label in enumerate(self.items[6:14]):
+            c.create_text(120 + (i % 4) * 110, 430 - (i // 4) * 32,
+                          text=label, fill="#5c4734", font=("Microsoft YaHei", 9))
+        c.create_text(290, 446, text="她自己的家 · 想放什么就放什么",
+                      fill="#8a6d50", font=("Microsoft YaHei", 9))
+
+
 class PetApp:
     def __init__(self, demo: bool = False, hidden: bool = False):
         self.demo = demo
@@ -1538,14 +1999,62 @@ class PetApp:
         agent.setdefault("enabled", True)
         agent.setdefault("max_steps", 6)
         agent.setdefault("allowed_roots", [str(BASE.parent)])
-        self.config.setdefault("quick_chat", True)
+        self.config.setdefault("quick_chat", False)
         self.config.setdefault("chat_open_on_start", False)
         self.config.setdefault("autonomy_enabled", True)
         self.config.setdefault("self_improve_enabled", True)
         self.config.setdefault("roam_enabled", False)
+        self.config.setdefault("click_sound", True)
+        self.config.setdefault("click_sound_style", "duck")
+        self.config.setdefault("personality_reactions", True)
+        self.config.setdefault("tray_enabled", True)
+        self.config.setdefault("autostart", False)
+        self.config.setdefault("click_through", False)
+        self.config.setdefault("lock_position", False)
+        self.config.setdefault("shift_drag_only", False)
+        self.config.setdefault("window_opacity", 1.0)
+        self.config.setdefault("hotkeys_enabled", True)
+        self.config.setdefault("free_placement", True)
+        vision_cfg = self.config.setdefault("vision", {})
+        if not isinstance(vision_cfg, dict):
+            vision_cfg = {}
+            self.config["vision"] = vision_cfg
+        vision_cfg.setdefault("enabled", False)
+        vision_cfg.setdefault("base_url", "")
+        vision_cfg.setdefault("model", "")
+        vision_cfg.setdefault("timeout_s", 60)
+        vision_cfg.setdefault("max_tokens", 400)
+        video_cfg = self.config.setdefault("video_gen", {})
+        if not isinstance(video_cfg, dict):
+            video_cfg = {}
+            self.config["video_gen"] = video_cfg
+        video_cfg.setdefault("model", "doubao-seedance-1-5-pro-251215")
+        video_cfg.setdefault("ratio", "16:9")
+        video_cfg.setdefault("duration", 5)
+        video_cfg.setdefault("resolution", "720p")
+        video_cfg.setdefault("generate_audio", True)
+        self.config.setdefault("voice_backend", "gptsovits")
+        gs_cfg = self.config.setdefault("gptsovits", {})
+        if not isinstance(gs_cfg, dict):
+            gs_cfg = {}
+            self.config["gptsovits"] = gs_cfg
+        gs_cfg.setdefault("base_url", "http://127.0.0.1:9880")
+        gs_cfg.setdefault("ref_audio_path", "cache/gptsovits/ref.wav")
+        gs_cfg.setdefault("prompt_text", "本鲸叫小鲸鱼，最喜欢白饭和主人的摸头。")
+        gs_cfg.setdefault("prompt_lang", "zh")
+        gs_cfg.setdefault("text_lang", "zh")
+        gs_cfg.setdefault("text_split_method", "cut5")
+        self.config.setdefault("voice_auto_send", False)
+        self.config.setdefault("asr_backend", "whisper")
+        self.config.setdefault("barge_in_enabled", True)
+        self.config.setdefault("click_jump", True)
+        self.config.setdefault("double_click_chat", False)
+        self.config.setdefault("visual_memory", True)
+        self.config.setdefault("visual_memory_interval", 300)
         agent_cfg = self.config.setdefault("agent", {})
         if isinstance(agent_cfg, dict):
             agent_cfg.setdefault("auto_approve", False)
+            agent_cfg.setdefault("auto_approve_own_home", True)  # 只自动放行 pet/home
         wake_cfg = self.config.setdefault("wake", {})
         if not isinstance(wake_cfg, dict):
             wake_cfg = {}
@@ -1603,6 +2112,17 @@ class PetApp:
         except Exception as exc:
             log(f"透明色键不可用：{exc}")
 
+        # 启动画面：先把主窗口藏起来，加载完再从屏幕底下游上来（隐藏模式不播）
+        self.splash = None
+        if not hidden:
+            self.root.withdraw()
+            try:
+                self.splash = Splash(self.root, self.display_name, self._splash_avatar())
+                self.splash.stage("加载形象……")
+            except Exception as exc:
+                log(f"启动画面失败（不影响启动）：{exc}")
+                self.splash = None
+
         self.library = AnimationLibrary(ASSETS, character=self.character)
         source_width, source_height = self.library.first_size()
         self.pet_w = DFY_TARGET_WIDTH if self.library.is_dfy else LEGACY_TARGET_WIDTH
@@ -1618,9 +2138,23 @@ class PetApp:
                                 highlightthickness=0, borderwidth=0)
         self.canvas.pack(fill="both", expand=True)
         self.animator = Animator(self.root, self.canvas, self.library, self.pet_w, self.W, self.H)
+        self.sfx = Sfx(BASE / "cache" / "sfx",
+                       enabled=lambda: not self.config.get("mute") and self.config.get("click_sound", True),
+                       style=lambda: str(self.config.get("click_sound_style") or "duck"))
         self.bubble = Bubble(self.canvas, self.W)
 
+        if self.splash:
+            self.splash.stage("唤醒大脑……")
         self.brain = Brain(BASE, self.config, log=log)
+        try:
+            # 记一次「自己身体的大致布局」，让模型点哪里时有自己的参考，而不是每次靠硬编码
+            facts = self.brain.memory_store.facts
+            if not any(str(item.get("key") or "") == "自我.身体布局" for item in facts):
+                self.brain.memory_store.add_fact(BODY_MAP_HINT, kind="note", importance=2,
+                                                  key="自我.身体布局")
+                self.brain.memory_store.save()
+        except Exception:
+            pass
         # 她吃的是 token：真实用量记账，自己花的从零食额度扣（appetite.json，个人数据）
         from appetite import Appetite
         life_cfg = self.config.get("life") if isinstance(self.config.get("life"), dict) else {}
@@ -1632,7 +2166,9 @@ class PetApp:
         self.reminders = ReminderBook(DATA_DIR / "reminders.json", log=log)
         self.appetite.listeners.append(
             lambda tokens, purpose: self.root.after(0, self._ate_tokens, tokens, purpose))
-        self.asr = ASR(language=self.config.get("asr_language", "zh-CN"), log=log)
+        self.asr = ASR(language=self.config.get("asr_language", "zh-CN"), log=log,
+                       backend=self.config.get("asr_backend", "whisper"),
+                       model_dir=BASE.parent / ".tools" / "faster-whisper-small")
         self.voice = VoiceEngine(self.root, ASSETS, CACHE, self.config, log=log,
                                  on_speaking=self._on_speaking)
         self.wake_listener = None
@@ -1676,6 +2212,15 @@ class PetApp:
         self._last_user_text = ""
         self.particles = Particles(self.canvas, self.W, self.H)
         self.stickers = StickerBook(ASSETS / "stickers")
+        self.songbook = Songbook(ASSETS / "songs", log=log)
+        self.douyin = DouyinBridge(log=log) if DouyinBridge else None
+        if self.douyin is not None:
+            try:
+                ok, message = self.douyin.sync_persona(BASE / "persona.md")
+                if ok:
+                    log("抖音助手人设：" + message)
+            except Exception as exc:
+                log(f"抖音助手人设同步失败（不影响桌宠）：{exc}")
         self.sticker_popup = StickerPopup(self)
         self._eating = False
         self._food_frames: list = []
@@ -1689,6 +2234,17 @@ class PetApp:
         self.chat_window: ChatWindow | None = None
         self.quick_chat: QuickChat | None = None
         self.settings_window: SettingsWindow | None = None
+        self.tray_service: TrayService | None = None
+        self.nest_window: NestWindow | None = None
+        self.hotkey_service: HotkeyService | None = None
+        self._hotkey_queue: queue.Queue[str] = queue.Queue()
+        self._hidden_paused = False
+        self._last_visual_memory = 0.0
+        self._last_screen_observation = ""
+        self._touch_zone_pending = "body"
+        self._touch_point_pending = (0.5, 0.2)
+        self._pat_zone = "body"
+        self._pat_point = (0.5, 0.2)
         self._drag: dict | None = None
         self._flight: dict | None = None
         self._flight_after = None
@@ -1701,13 +2257,19 @@ class PetApp:
         self.root.bind("<Enter>", self._on_hover, add="+")
         self._bind_events()
         # 住在桌面上：窗口当平台、自己过日子（生活状态存 life.json，她写的东西在 home/）
+        if self.splash:
+            self.splash.stage("翻翻记忆和小窝……")
         from living import Living
         self.living = Living(self, DATA_DIR / "life.json", DATA_DIR / "home", log=log)
         self.menu = self._build_menu()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
         self.animator.play(self.library.best("idle"))
-        self.root.after(700, self._startup)
+        if self.splash:
+            self.splash.stage("马上就来……")
+            self.root.after(250, self._entrance)  # 入场动画播完再打招呼
+        else:
+            self.root.after(700, self._startup)
         self.living.start()
         self._pet_state: dict = {}
         self._refresh_pet_state()
@@ -1717,7 +2279,7 @@ class PetApp:
         self.root.after(8000, self._proactive_tick)
         self.root.after(3000, self._overview_tick)
         self.root.after(8000, self._roam_tick)
-        if not hidden and self.config.get("quick_chat", True):
+        if not hidden and self.config.get("quick_chat", False):
             self.root.after(1600, self.open_quick_chat)
         if not hidden and self.config.get("chat_open_on_start"):
             self.root.after(2000, self.open_chat)
@@ -1731,6 +2293,12 @@ class PetApp:
             self.root.after(2600, self.start_qq)
         if (self.config.get("wechat") or {}).get("enabled"):
             self.root.after(3200, self.start_wechat)
+        self.config["autostart"] = autostart_enabled()
+        self.root.after(900, self._start_tray)
+        self.root.after(1200, self._start_hotkeys)
+        self.root.after(200, self._poll_hotkeys)
+        self.root.after(1400, self._apply_saved_opacity)
+        self.root.after(2600, self._cleanup_old_screens)
 
     # ---------- DSH 状态 / 互动时间 ----------
     def _status_path(self) -> Path:
@@ -1898,6 +2466,17 @@ class PetApp:
         appetite = getattr(self, "appetite", None)
         if appetite is not None and appetite.hungry_for_tokens():
             parts.append("你的 token 零食额度快吃光了，有点饿")
+        douyin = getattr(self, "douyin", None)
+        if douyin is not None:
+            try:
+                report = douyin.report_summary(120)
+                if report:
+                    parts.append(f"抖音助手：{report}")
+                watching = douyin.context_line(160)
+                if watching:
+                    parts.append(watching)
+            except Exception:
+                pass
         try:
             import desktop
             label = desktop.guess_activity(desktop.foreground_title())
@@ -1923,6 +2502,8 @@ class PetApp:
         return f"你刚刚记下了「{added[0]['event']}」的提醒（{plan}），到点系统会自动提醒主人，可以放心答应，简单说一下就行"
 
     def ask_agent(self, text: str, on_reply=None) -> None:
+        if self._maybe_sing(text, on_reply):
+            return
         self.brain.live_context = self.live_context()
         note = self._reminder_note(text)
         if note:
@@ -2002,6 +2583,7 @@ class PetApp:
             y = screen_h - self.H - 90
         x = max(0, min(screen_w - self.W, x))
         y = max(0, min(screen_h - self.H, y))
+        self._home = (x, y)  # 入场动画的落点
         self.root.geometry(f"+{x}+{y}")
 
     def _save_position(self) -> None:
@@ -2028,8 +2610,15 @@ class PetApp:
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_motion)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<Double-Button-1>", lambda event: self.open_chat())
+        # 双击默认打开喂食面板；想要回聊天：config 里 double_click_chat: true
+        self.canvas.bind("<Double-Button-1>", self._on_double_click)
         self.canvas.bind("<Button-3>", self._on_context_menu)
+
+    def _on_double_click(self, event=None) -> None:
+        if self.config.get("double_click_chat"):
+            self.open_chat()
+        else:
+            self.open_feed_panel()
 
     def _on_press(self, event) -> None:
         if self._flight_after is not None:
@@ -2039,6 +2628,16 @@ class PetApp:
                 pass
             self._flight_after = None
         self._flight = None
+        self.animator.press()
+        self.sfx.play("press")
+        self._touch_zone_pending = self._zone_at(event.x, event.y)
+        self._touch_point_pending = self._point_at(event.x, event.y)
+        locked = bool(self.config.get("lock_position"))
+        shift_only = bool(self.config.get("shift_drag_only"))
+        shift_down = bool(event.state & 0x0001)
+        if locked or (shift_only and not shift_down):
+            self._drag = {"locked": True, "moved": False}
+            return
         self._drag = {
             "sx": event.x_root, "sy": event.y_root,
             "wx": self.root.winfo_x(), "wy": self.root.winfo_y(), "moved": False,
@@ -2046,14 +2645,15 @@ class PetApp:
         }
 
     def _on_motion(self, event) -> None:
-        if not self._drag:
+        if not self._drag or self._drag.get("locked"):
             return
         self._drag["samples"].append((time.monotonic(), event.x_root, event.y_root))
         self._drag["samples"] = self._drag["samples"][-6:]
         dx = event.x_root - self._drag["sx"]
         dy = event.y_root - self._drag["sy"]
-        if abs(dx) + abs(dy) > 5:
+        if abs(dx) + abs(dy) > 5 and not self._drag["moved"]:
             self._drag["moved"] = True
+            self.animator.release()  # 拖起来了就别一直扁着
         if self._drag["moved"]:
             self.root.geometry(f"+{self._drag['wx'] + dx}+{self._drag['wy'] + dy}")
 
@@ -2062,6 +2662,9 @@ class PetApp:
         self._drag = None
         if not drag:
             return
+        if not drag["moved"]:
+            self.animator.release()
+            self.sfx.play("release")
         if drag["moved"]:
             drag["samples"].append((time.monotonic(), event.x_root, event.y_root))
             drag["samples"] = drag["samples"][-6:]
@@ -2077,7 +2680,45 @@ class PetApp:
             if self._living_on():
                 self.living.dropped()  # 放在半空会掉到下面的窗口或任务栏上
         else:
-            self.pat()
+            self.pat(self._touch_zone_pending, self._touch_point_pending)
+
+    def _point_at(self, x: float, y: float) -> tuple[float, float]:
+        """画布坐标 → 立绘内的归一化坐标（x 0..1，y 0..1）。"""
+        try:
+            coords = self.canvas.coords(self.animator.item)
+            if not coords:
+                return 0.5, 0.2
+            target_w = float(self.animator.target_width)
+            state = self.library.best("idle")
+            frames = self.library.states.get(state) or []
+            if not frames:
+                return 0.5, 0.2
+            image = frames[0][0]
+            target_h = image.height * (target_w / max(1, image.width))
+            cx, cy = float(coords[0]), float(coords[1])
+            nx = (float(x) - (cx - target_w / 2)) / max(1.0, target_w)
+            ny = (float(y) - (cy - target_h)) / max(1.0, target_h)
+            return max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))
+        except Exception:
+            return 0.5, 0.2
+
+    def _zone_at(self, x: float, y: float) -> str:
+        """按当前立绘在画布上的位置，判断点到哪个身体区域。"""
+        try:
+            coords = self.canvas.coords(self.animator.item)
+            if not coords:
+                return "body"
+            target_w = float(self.animator.target_width)
+            state = self.library.best("idle")
+            frames = self.library.states.get(state) or []
+            if not frames:
+                return "body"
+            image = frames[0][0]
+            target_h = image.height * (target_w / max(1, image.width))
+            cx, cy = float(coords[0]), float(coords[1])
+            return zone_for(x, y, cx - target_w / 2, cy - target_h, target_w, target_h)
+        except Exception:
+            return "body"
 
     def _living_on(self) -> bool:
         living = getattr(self, "living", None)
@@ -2112,6 +2753,9 @@ class PetApp:
         return None
 
     def _start_flight(self, vx: float, vy: float) -> None:
+        if self.config.get("free_placement", True):
+            self.bubble.show("本鲸现在固定摆放，飞不起来。", 2200)
+            return
         if self._living_on():  # 住在桌面模式：交给 living 的物理，能落在窗口顶上
             self.living.toss(vx, vy)
             self._set_emotion("surprised", duration_ms=1600)
@@ -2168,50 +2812,137 @@ class PetApp:
     # ---------- 菜单 ----------
     def _build_menu(self) -> tk.Menu:
         menu = tk.Menu(self.root, tearoff=0, font=("Microsoft YaHei", 9))
+
+        def sub(label: str) -> tk.Menu:
+            child = tk.Menu(menu, tearoff=0, font=("Microsoft YaHei", 9))
+            menu.add_cascade(label=label, menu=child)
+            return child
+
+        # 顶层只留最常用三个，其余收进分组
         menu.add_command(label="🗨️  打开聊天大窗", command=self.open_chat)
-        self.quick_var = tk.BooleanVar(value=bool(self.config.get("quick_chat", True)))
-        menu.add_checkbutton(label="⌨  桌面聊天面板", variable=self.quick_var, command=self.toggle_quick_chat)
+        menu.add_command(label="👀  看看屏幕", command=self.see_screen)
+        menu.add_separator()
+
+        # ---------- 聊天与语音 ----------
+        chat = sub("💬  聊天与语音")
+        self.quick_var = tk.BooleanVar(value=bool(self.config.get("quick_chat", False)))
+        chat.add_checkbutton(label="⌨  桌面聊天面板", variable=self.quick_var,
+                             command=self.toggle_quick_chat)
         self.wake_var = tk.BooleanVar(value=bool((self.config.get("wake") or {}).get("enabled")))
-        menu.add_checkbutton(label="🎙  喊名字唤醒（联网识别）", variable=self.wake_var,
-                             command=self.toggle_wake)
-        self.autonomy_var = tk.BooleanVar(value=bool(self.config.get("autonomy_enabled", True)))
-        menu.add_checkbutton(label="🎲  让她自己动一动", variable=self.autonomy_var,
-                             command=self.toggle_autonomy)
-        menu.add_command(label="🧠  打开相处笔记", command=self.open_learned_notes)
-        menu.add_command(label="🧾  打开 PARTNER.md", command=self.open_partner)
-        menu.add_command(label="🌉  QQ 共用大脑接口", command=self.show_shared_brain)
-        menu.add_command(label="💬  网页聊天（浏览器）", command=self.open_web_chat)
-        self.wechat_var = tk.BooleanVar(value=bool((self.config.get("wechat") or {}).get("enabled")))
-        menu.add_checkbutton(label="📮  公众号接入", variable=self.wechat_var,
-                             command=self.toggle_wechat)
-        menu.add_command(label="📡  公众号状态", command=self.show_wechat_status)
-        menu.add_command(label="🍚  看看饭碗（余额与今天吃了多少 token）", command=self.check_balance)
-        menu.add_command(label="🧠  看她的记忆", command=self.show_memory)
+        chat.add_checkbutton(label="🎙  喊名字唤醒", variable=self.wake_var, command=self.toggle_wake)
+        chat.add_separator()
+        self.mute_var = tk.BooleanVar(value=bool(self.config.get("mute")))
+        chat.add_checkbutton(label="🔇  静音", variable=self.mute_var, command=self.toggle_mute)
+        voice_menu = tk.Menu(chat, tearoff=0, font=("Microsoft YaHei", 9))
+        current_voice = str(self.config.get("voice_backend") or "edge").lower()
+        if current_voice not in ("gptsovits", "gpt-sovits", "edge"):
+            current_voice = "edge"
+        self.voice_backend_var = tk.StringVar(value=current_voice)
+        voice_menu.add_radiobutton(label="晓伊（在线系统音色）", variable=self.voice_backend_var,
+                                   value="edge", command=lambda: self.set_voice_backend("edge"))
+        voice_menu.add_radiobutton(label="GPT-SoVITS（本地克隆）", variable=self.voice_backend_var,
+                                   value="gptsovits", command=lambda: self.set_voice_backend("gptsovits"))
+        voice_menu.add_separator()
+        voice_menu.add_command(label="🔊  试听现在的声音", command=self.test_voice)
+        chat.add_cascade(label="🔊  说话声音", menu=voice_menu)
+        asr_menu = tk.Menu(chat, tearoff=0, font=("Microsoft YaHei", 9))
+        self.asr_backend_var = tk.StringVar(value=str(self.config.get("asr_backend") or "whisper"))
+        asr_menu.add_radiobutton(label="本地 Whisper（推荐，离线）", variable=self.asr_backend_var,
+                                 value="whisper", command=lambda: self.set_asr_backend("whisper"))
+        asr_menu.add_radiobutton(label="Google 在线识别", variable=self.asr_backend_var,
+                                 value="google", command=lambda: self.set_asr_backend("google"))
+        chat.add_cascade(label="🎧  听写引擎", menu=asr_menu)
+        chat.add_separator()
+        chat.add_command(label="👀  看看屏幕（截图+窗口）", command=self.see_screen)
+        chat.add_command(label="🖼  打开最近截图", command=self.open_last_screen)
+        chat.add_command(label="🎞  看视频…", command=self.see_video)
+        chat.add_command(label="📰  看看新闻", command=self.see_news)
+        chat.add_command(label="🌐  上网查资料…", command=self.research_web)
+        chat.add_command(label="🪄  自己找资料优化自己…", command=self.optimize_self)
+        chat.add_command(label="🔮  视觉模型设置…", command=self.configure_vision)
+        chat.add_command(label="💬  网页聊天（浏览器）", command=self.open_web_chat)
+
+        # ---------- 小窝与记忆 ----------
+        home = sub("🏠  小窝与记忆")
+        home.add_command(label="🏡  打开桌面小窝", command=self.open_nest)
+        home.add_command(label="🪺  让她往窝里添一件", command=self.build_nest)
+        home.add_command(label="📦  往窝里放点东西…", command=self.add_nest_item)
+        home.add_command(label="📂  打开小窝文件夹", command=self.open_home)
+        home.add_command(label="🧠  让她整理小屋/自省", command=self.reflect_home)
+        home.add_separator()
+        home.add_command(label="🧾  看她的记忆", command=self.show_memory)
+        home.add_command(label="📝  打开相处笔记", command=self.open_learned_notes)
+        home.add_command(label="🧾  打开 PARTNER.md", command=self.open_partner)
+        home.add_separator()
         self.roam_var = tk.BooleanVar(value=bool(self.living.cfg.get("enabled", True)))
-        menu.add_checkbutton(label="🏠  住在桌面上（自己生活）", variable=self.roam_var,
+        home.add_checkbutton(label="🏠  住在桌面上（自己生活）", variable=self.roam_var,
                              command=self.toggle_living)
-        menu.add_command(label="📂  打开她的小窝", command=self.open_home)
+        self.autonomy_var = tk.BooleanVar(value=bool(self.config.get("autonomy_enabled", True)))
+        home.add_checkbutton(label="🎲  让她自己动一动", variable=self.autonomy_var,
+                             command=self.toggle_autonomy)
+
+        # ---------- 形象与桌面 ----------
+        look = sub("🎭  形象与桌面")
+        look.add_command(label="🎭  2D 虚拟形象（浏览器）", command=self.open_avatar)
+        look.add_command(label="🪟  2D 悬浮层（置顶）", command=self.open_avatar_overlay)
+        character_menu = tk.Menu(look, tearoff=0, font=("Microsoft YaHei", 9))
+        for char_id, char_name in self.available_characters():
+            prefix = "✓ " if char_id == self.character else "   "
+            character_menu.add_command(label=prefix + char_name,
+                                       command=lambda c=char_id: self.switch_character(c))
+        look.add_cascade(label="🎨  换个形象", menu=character_menu)
+        self.topmost_var = tk.BooleanVar(value=bool(self.config.get("always_on_top", True)))
+        look.add_checkbutton(label="📌  窗口置顶", variable=self.topmost_var,
+                             command=self.toggle_topmost)
         self.body3d_var = tk.BooleanVar(value=False)
-        menu.add_checkbutton(label="🧊  3D 身体（实验）", variable=self.body3d_var, command=self.toggle_body3d)
-        self.auto_approve_var = tk.BooleanVar(
-            value=bool((self.config.get("agent") or {}).get("auto_approve")))
-        menu.add_checkbutton(label="🔓  全权限托管（危险）", variable=self.auto_approve_var,
-                             command=self.toggle_auto_approve)
-        self.qq_var = tk.BooleanVar(value=bool((self.config.get("qq") or {}).get("enabled")))
-        menu.add_checkbutton(label="📨  通到 QQ（OneBot）", variable=self.qq_var,
-                             command=self.toggle_qq)
-        menu.add_command(label="📡  QQ 桥状态", command=self.show_qq_status)
-        menu.add_command(label="🤚  摸摸头", command=self.pat)
-        feed_menu = tk.Menu(menu, tearoff=0, font=("Microsoft YaHei", 9))
+        if self.config.get("body3d_menu"):
+            look.add_checkbutton(label="🧊  3D 身体（实验）", variable=self.body3d_var,
+                                 command=self.toggle_body3d)
+        look.add_separator()
+        look.add_command(label="⌨  全局快捷键说明", command=self.show_hotkeys)
+
+        desktop_menu = tk.Menu(look, tearoff=0, font=("Microsoft YaHei", 9))
+        self.autostart_var = tk.BooleanVar(value=autostart_enabled())
+        desktop_menu.add_checkbutton(label="🚀  开机自启", variable=self.autostart_var,
+                                     command=self.toggle_autostart)
+        self.click_through_var = tk.BooleanVar(value=bool(self.config.get("click_through", False)))
+        tray_hint = "" if tray_available() else "（需先启用托盘）"
+        desktop_menu.add_checkbutton(label=f"🖱  鼠标穿透{tray_hint}", variable=self.click_through_var,
+                                     command=self.toggle_click_through)
+        self.lock_position_var = tk.BooleanVar(value=bool(self.config.get("lock_position", False)))
+        desktop_menu.add_checkbutton(label="🔒  锁定位置", variable=self.lock_position_var,
+                                     command=self.toggle_lock_position)
+        self.shift_drag_var = tk.BooleanVar(value=bool(self.config.get("shift_drag_only", False)))
+        desktop_menu.add_checkbutton(label="⇧  仅按住 Shift 可拖动", variable=self.shift_drag_var,
+                                     command=self.toggle_shift_drag)
+        opacity_menu = tk.Menu(desktop_menu, tearoff=0, font=("Microsoft YaHei", 9))
+        for pct in (100, 90, 75, 60, 45):
+            opacity_menu.add_command(label=f"{pct}%",
+                                     command=lambda v=pct: self.set_window_opacity(v / 100))
+        desktop_menu.add_cascade(label="👁  不透明度", menu=opacity_menu)
+        self.free_place_var = tk.BooleanVar(value=bool(self.config.get("free_placement", True)))
+        desktop_menu.add_checkbutton(label="📌  放到哪停哪（关闭重力/自动走）",
+                                     variable=self.free_place_var,
+                                     command=self.toggle_free_placement)
+        desktop_menu.add_command(label="↩  回到默认位置", command=self.reset_position)
+        if tray_available():
+            desktop_menu.add_command(label="📌  托盘图标常驻", command=self.show_tray_hint)
+        look.add_cascade(label="🖥  桌面集成", menu=desktop_menu)
+
+        # ---------- 互动与音乐 ----------
+        fun = sub("🍚  互动与音乐")
+        fun.add_command(label="🤚  摸摸头", command=self.pat)
+        fun.add_command(label="🍽  喂食面板", command=self.open_feed_panel)
+        feed_menu = tk.Menu(fun, tearoff=0, font=("Microsoft YaHei", 9))
         for key, label in (("rice", "🍚 白饭"), ("fish", "🐟 小鱼干"),
                            ("cake", "🍰 蛋糕"), ("tangyuan", "🍡 团子"),
                            ("diamond", "💎 钻石")):
             feed_menu.add_command(label=label, command=lambda food=key: self.feed(food))
-        menu.add_cascade(label="🍽  投喂", menu=feed_menu)
-        menu.add_command(label="🖼  甩个表情包",
-                         command=lambda: self.send_sticker(self._emotion if self._emotion != "idle" else "happy",
-                                                           force=True))
-        perform_menu = tk.Menu(menu, tearoff=0, font=("Microsoft YaHei", 9))
+        fun.add_cascade(label="🍽  直接投喂", menu=feed_menu)
+        fun.add_command(label="🖼  甩个表情包",
+                        command=lambda: self.send_sticker(
+                            self._emotion if self._emotion != "idle" else "happy", force=True))
+        perform_menu = tk.Menu(fun, tearoff=0, font=("Microsoft YaHei", 9))
         for key, label in (("happy", "开心"), ("shy", "害羞"), ("angry", "生气"),
                            ("sad", "难过"), ("surprised", "惊讶"), ("confused", "困惑"),
                            ("sleepy", "困倦"), ("proud", "得意"), ("hungry", "馋嘴")):
@@ -2219,39 +2950,112 @@ class PetApp:
         perform_menu.add_separator()
         perform_menu.add_command(label="🎲 随机一个",
                                  command=lambda: self.perform(random.choice(DFY_EMOTIONS)))
-        menu.add_cascade(label="✨  让她表演", menu=perform_menu)
-        character_menu = tk.Menu(menu, tearoff=0, font=("Microsoft YaHei", 9))
-        for char_id, char_name in self.available_characters():
-            prefix = "✓ " if char_id == self.character else "   "
-            character_menu.add_command(label=prefix + char_name,
-                                       command=lambda c=char_id: self.switch_character(c))
-        menu.add_cascade(label="🎭  换个形象", menu=character_menu)
-        menu.add_command(label="📋  工作总览", command=self.open_overview)
-        personal_menu = tk.Menu(menu, tearoff=0, font=("Microsoft YaHei", 9))
+        fun.add_cascade(label="✨  让她表演", menu=perform_menu)
+        fun.add_separator()
+        fun.add_command(label="🎵  唱首歌", command=self.sing_song)
+        fun.add_command(label="🎤  让她唱（Seed-VC）…", command=self.sing_seedvc)
+        fun.add_command(label="🎶  让她自己找首歌唱", command=self.sing_seedvc_auto)
+        itunes_menu = tk.Menu(fun, tearoff=0, font=("Microsoft YaHei", 9))
+        itunes_menu.add_command(label="播放 / 暂停", command=lambda: self.itunes_action(itunes_play_pause))
+        itunes_menu.add_command(label="上一首", command=lambda: self.itunes_action(itunes_previous))
+        itunes_menu.add_command(label="下一首", command=lambda: self.itunes_action(itunes_next))
+        itunes_menu.add_command(label="从音乐库第一首播放", command=lambda: self.itunes_action(itunes_play_first))
+        itunes_menu.add_command(label="搜索播放…", command=self.itunes_search)
+        itunes_menu.add_separator()
+        itunes_menu.add_command(label="现在播放什么", command=self.itunes_show_now)
+        itunes_menu.add_command(label="停止", command=lambda: self.itunes_action(itunes_stop))
+        fun.add_cascade(label="🎵  iTunes", menu=itunes_menu)
+        netease_menu = tk.Menu(fun, tearoff=0, font=("Microsoft YaHei", 9))
+        netease_menu.add_command(label="搜索播放…", command=self.netease_play)
+        netease_menu.add_command(label="停止播放", command=self.voice.stop)
+        fun.add_cascade(label="☁️  网易云音乐", menu=netease_menu)
+
+        # ---------- 连接与助手 ----------
+        connect = sub("📡  连接与助手")
+        douyin_menu = tk.Menu(connect, tearoff=0, font=("Microsoft YaHei", 9))
+        douyin_menu.add_command(label="看今日抖音日报", command=self.show_douyin_report)
+        douyin_menu.add_command(label="把小鲸鱼人设同步过去", command=self.sync_douyin_persona)
+        douyin_menu.add_command(label="抖音助手状态", command=self.show_douyin_status)
+        connect.add_cascade(label="📱  抖音助手", menu=douyin_menu)
+        self.qq_var = tk.BooleanVar(value=bool((self.config.get("qq") or {}).get("enabled")))
+        connect.add_checkbutton(label="📨  通到 QQ（OneBot）", variable=self.qq_var, command=self.toggle_qq)
+        connect.add_command(label="📡  QQ 桥状态", command=self.show_qq_status)
+        self.wechat_var = tk.BooleanVar(value=bool((self.config.get("wechat") or {}).get("enabled")))
+        connect.add_checkbutton(label="📮  公众号接入", variable=self.wechat_var, command=self.toggle_wechat)
+        connect.add_command(label="📡  公众号状态", command=self.show_wechat_status)
+        connect.add_separator()
+        connect.add_command(label="🌉  QQ 共用大脑接口", command=self.show_shared_brain)
+        connect.add_command(label="📋  工作总览", command=self.open_overview)
+        personal_menu = tk.Menu(connect, tearoff=0, font=("Microsoft YaHei", 9))
         personal_menu.add_command(label="查看接入状态", command=self.show_personal)
         personal_menu.add_command(label="刷新个人库", command=self.refresh_personal)
         personal_menu.add_command(label="打开个人库目录", command=self.open_personal_dir)
-        menu.add_cascade(label="📚  个人库", menu=personal_menu)
-        menu.add_separator()
-        self.mute_var = tk.BooleanVar(value=bool(self.config.get("mute")))
-        menu.add_checkbutton(label="🔇  静音", variable=self.mute_var, command=self.toggle_mute)
-        self.topmost_var = tk.BooleanVar(value=bool(self.config.get("always_on_top", True)))
-        menu.add_checkbutton(label="📌  窗口置顶", variable=self.topmost_var, command=self.toggle_topmost)
+        connect.add_cascade(label="📚  个人库", menu=personal_menu)
+
+        # ---------- 设置与系统 ----------
+        system = sub("⚙️  设置与系统")
+        system.add_command(label="🍚  看看饭碗（余额/今日 token）", command=self.check_balance)
         self.dsh_var = tk.BooleanVar(value=bool((self.config.get("dsh_status") or {}).get("enabled", True)))
-        menu.add_checkbutton(label="🌊  跟随 DSH 工作状态", variable=self.dsh_var,
-                             command=self.toggle_dsh_follow)
-        self.proactive_var = tk.BooleanVar(value=bool((self.config.get("proactive") or {}).get("enabled", True)))
-        menu.add_checkbutton(label="💬  允许主动搭话", variable=self.proactive_var,
-                             command=self.toggle_proactive)
-        menu.add_separator()
-        menu.add_command(label="⚙  设置…", command=self.open_settings)
-        menu.add_command(label="❌  退出", command=self.quit)
+        system.add_checkbutton(label="🌊  跟随 DSH 工作状态", variable=self.dsh_var,
+                               command=self.toggle_dsh_follow)
+        self.proactive_var = tk.BooleanVar(
+            value=bool((self.config.get("proactive") or {}).get("enabled", True)))
+        system.add_checkbutton(label="💬  允许主动搭话", variable=self.proactive_var,
+                               command=self.toggle_proactive)
+        self.auto_approve_var = tk.BooleanVar(
+            value=bool((self.config.get("agent") or {}).get("auto_approve")))
+        system.add_checkbutton(label="🔓  全权限托管（危险）", variable=self.auto_approve_var,
+                               command=self.toggle_auto_approve)
+        system.add_separator()
+        system.add_command(label="⚙  设置…", command=self.open_settings)
+        system.add_command(label="❌  退出", command=self.quit)
         return menu
 
     def toggle_mute(self) -> None:
         self.config["mute"] = bool(self.mute_var.get())
         self.save_config()
         self.bubble.show("静音啦。" if self.config["mute"] else "声音回来啦。", 1600)
+
+    def set_voice_backend(self, backend: str) -> None:
+        backend = "gptsovits" if str(backend).lower() in ("gptsovits", "gpt-sovits") else "edge"
+        self.config["voice_backend"] = backend
+        self.save_config()
+        try:
+            self.voice_backend_var.set(backend)
+        except Exception:
+            pass
+        if backend == "gptsovits":
+            self.bubble.show("声音切到 GPT-SoVITS；服务器没开时会自动回退晓伊。", 3800)
+        else:
+            self.bubble.show("声音切回晓伊（在线系统音色）。", 3000)
+
+    def test_voice(self) -> None:
+        try:
+            self.voice.speak("本鲸现在用这个声音说话，你听听喜不喜欢。")
+            self.bubble.show("试听中……", 1800)
+        except Exception as exc:
+            self.bubble.show("试听失败：" + str(exc)[:220], 4200)
+
+    def set_asr_backend(self, backend: str) -> None:
+        backend = "google" if str(backend).lower() == "google" else "whisper"
+        self.config["asr_backend"] = backend
+        try:
+            self.asr.backend = backend
+        except Exception:
+            pass
+        self.save_config()
+        try:
+            self.asr_backend_var.set(backend)
+        except Exception:
+            pass
+        self.bubble.show("听写切到：" + ("本地 Whisper" if backend == "whisper" else "Google 在线"), 2600)
+
+    def toggle_voice_backend(self) -> None:
+        use_new = bool(self.gptsovits_var.get())
+        self.config["voice_backend"] = "gptsovits" if use_new else "edge"
+        self.save_config()
+        self.bubble.show("以后用她的 GPT-SoVITS 声音说话。" if use_new
+                         else "先用回晓伊声音（GPT-SoVITS 服务器可留着）。", 3600)
 
     def toggle_topmost(self) -> None:
         value = bool(self.topmost_var.get())
@@ -2382,6 +3186,53 @@ class PetApp:
         self._set_emotion(emotion, duration_ms=4200)
         self.bubble.show(random.choice(EMOTION_LINES.get(emotion, ("……",))), 2600)
 
+    # ---------- 启动：启动画面 → 从屏幕底下游上来 → 打招呼 ----------
+    def _splash_avatar(self) -> Path | None:
+        pack = ASSETS / "characters" / self.character / "anim"
+        for candidate in (pack / "idle.webp", pack / "happy.webp", ASSETS / "anim" / "idle.webp"):
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _entrance(self) -> None:
+        splash, self.splash = self.splash, None
+        if splash is not None:
+            splash.close(then=self._rise_up)
+        else:
+            self._rise_up()
+
+    def _rise_up(self) -> None:
+        """从屏幕底下沿弧线游上来，快到位时轻轻回弹，一路冒泡泡；落定后打招呼。"""
+        x, y = getattr(self, "_home", (self.root.winfo_x(), self.root.winfo_y()))
+        start_y = self.root.winfo_screenheight() + 20
+        self._entering = True  # 入场时人在屏幕下面：桌面生活的物理先别管她，不然会当成悬空一路掉出屏幕
+        self.root.geometry(f"+{x}+{start_y}")
+        self.root.deiconify()
+        self.animator.play(self._state_for("happy"))
+        frames = 28
+
+        def ease_out_back(t: float) -> float:
+            c1 = 1.4
+            return 1 + (c1 + 1) * (t - 1) ** 3 + c1 * (t - 1) ** 2
+
+        def step(i: int) -> None:
+            t = i / frames
+            cur = start_y + (y - start_y) * ease_out_back(t)
+            sway = math.sin(t * math.pi * 2) * 10 * (1 - t)  # 游的时候左右摆一摆
+            self.root.geometry(f"+{int(x + sway)}+{int(cur)}")
+            if i % 7 == 0:
+                self.particles.burst("bubbles", count=3, base_y=self.H - 40)
+            if i < frames:
+                self.root.after(30, step, i + 1)
+            else:
+                self.root.geometry(f"+{x}+{y}")
+                self._entering = False
+                if self._living_on():
+                    self.living.dropped()  # 落定后交给物理：站到脚下的窗口或任务栏上
+                self._startup()
+
+        step(1)
+
     def _greet_animation(self) -> None:
         if self.library.is_dfy:
             self.animator.play(self._state_for("wave"), once=True, then=self._state_for("idle"))
@@ -2407,12 +3258,37 @@ class PetApp:
         candidates = [(text, path) for text, path in self._preset_lines if any(k in text for k in keywords)]
         return random.choice(candidates) if candidates else None
 
-    def _react(self, keywords: tuple[str, ...], fallback: tuple[str, ...], emotion: str) -> None:
+    def _speak_preset(self, text: str, path) -> None:
+        """GPT-SoVITS 模式跳过旧晓伊预合成，用新音色重合成。"""
+        if str(self.config.get("voice_backend") or "").lower() == "gptsovits":
+            self.voice.speak(text)
+        else:
+            self.voice.speak(preset=path)
+
+    def _react(self, keywords: tuple[str, ...], fallback: tuple[str, ...], emotion: str | None,
+               event: str | None = None) -> None:
+        # 人格反应：不查固定台词，让模型按她的人设/记忆/上下文即兴说一句。
+        if self.config.get("personality_reactions", True) and getattr(self, "brain", None) is not None:
+            base = event or (f"主人对你说/做了「{keywords[0]}」" if keywords else "主人在逗你")
+            fallback_line = random.choice(fallback)
+            if emotion:
+                self._set_emotion(emotion, duration_ms=3200)
+
+            def worker() -> None:
+                try:
+                    line = self.brain.react(base, fallback_line)
+                except Exception:
+                    line = fallback_line
+                final_emotion = emotion or self._emotion_for_reply(line, "llm")
+                self.root.after(0, self._react_done, line, final_emotion)
+
+            threading.Thread(target=worker, daemon=True).start()
+            return
         picked = self._pick_preset(*keywords)
         if picked:
             text, path = picked
             self.bubble.show(text)
-            self.voice.speak(preset=path)
+            self._speak_preset(text, path)
         else:
             text = random.choice(fallback)
             self.bubble.show(text)
@@ -2420,16 +3296,43 @@ class PetApp:
         self._cancel_speech_settle()
         self._set_emotion(emotion, duration_ms=3200)
 
-    def pat(self) -> None:
+    def _react_done(self, text: str, emotion: str) -> None:
+        text = (text or "").strip() or "……"
+        self.bubble.show(text, 4800)
+        self.voice.speak(text)
+        self._cancel_speech_settle()
+        self._set_emotion(emotion, duration_ms=3200)
+
+    def pat(self, zone: str = "body", point: tuple[float, float] | None = None) -> None:
         self._touch()
         self.living.event("pat")
-        self._react(("摸摸", "摸头", "头", "贴贴", "抱抱"), (
-            "唔……只能摸一下哦，摸多了本鲸的算力会不稳定……再摸一下也行。",
-            "（鲸鳍耳像含羞草一样缩起来）才、才没有很舒服。",
-            "摸头可以，摸呆毛要收费，一根白饭。",
-            "尾巴是奖励，不是随便摸的……好吧，给你摸一下。",
-            "哼，算你有点眼光，本鲸的头很软的。",
-        ), "shy")
+        self._pat_zone = zone if zone in ("head", "face", "ear", "belly", "tail", "hand", "body") else "body"
+        self._pat_point = point or (0.5, 0.2)
+        # 连续点击合并成一次反应：声音/按压每下都有，但说话和气泡只在停手后回一次。
+        self._pat_count = int(getattr(self, "_pat_count", 0)) + 1
+        job = getattr(self, "_pat_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._pat_job = self.root.after(700, self._finish_pat)
+
+    def _finish_pat(self) -> None:
+        count = max(1, int(getattr(self, "_pat_count", 1)))
+        point = getattr(self, "_pat_point", (0.5, 0.2))
+        self._pat_job = None
+        self._pat_count = 0
+        # 不告诉模型“这是头/尾巴”，只给坐标；让模型自己理解身体部位并决定反应
+        self._react(("摸摸", "碰碰", "贴贴", "抱抱"),
+                    ("唔……", "……"), None,
+                    event=touch_point_event(point[0], point[1], count))
+        if self.config.get("click_jump", True):
+            try:
+                self.animator.play(self.library.best("jump", "happy", "idle"), once=True,
+                                   then=self.library.best("idle"))
+            except Exception:
+                pass
 
     def _on_hover(self, event=None) -> None:
         try:
@@ -2444,6 +3347,37 @@ class PetApp:
                 self._set_emotion(random.choice(("shy", "happy", "surprised")), duration_ms=2600)
         except Exception:
             pass
+
+    def open_feed_panel(self) -> None:
+        """她身边的喂食面板：双击或右键菜单打开。"""
+        panel = getattr(self, "feed_panel", None)
+        if panel is not None and panel.winfo_exists():
+            panel.lift()
+            return
+        win = tk.Toplevel(self.root)
+        self.feed_panel = win
+        win.overrideredirect(True)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        win.configure(bg="#eef4ff")
+        px, py = self.root.winfo_x(), self.root.winfo_y()
+        win.geometry(f"300x92+{px + 70}+{max(20, py - 100)}")
+        outer = tk.Frame(win, bg="#ffffff", highlightbackground="#a9c3f2", highlightthickness=2)
+        outer.pack(fill="both", expand=True, padx=3, pady=3)
+        tk.Label(outer, text="喂她点什么？", bg="#ffffff", fg="#24468f",
+                 font=("Microsoft YaHei", 9, "bold")).pack(anchor="w", padx=8, pady=(5, 2))
+        row = tk.Frame(outer, bg="#ffffff")
+        row.pack(fill="x", padx=6, pady=(0, 5))
+        foods = (("rice", "🍚 白饭"), ("fish", "🐟 小鱼干"), ("cake", "🍰 蛋糕"),
+                 ("tangyuan", "🍡 团子"), ("diamond", "💎 钻石"))
+        for key, label in foods:
+            tk.Button(row, text=label, command=lambda f=key: (self.feed(f), win.destroy()),
+                      bg="#f5f8ff", fg="#2a3550", relief="flat", cursor="hand2",
+                      font=("Microsoft YaHei", 8), padx=5).pack(side="left", padx=2)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.after(12000, lambda: win.destroy() if win.winfo_exists() else None)
 
     def feed(self, food: str = "rice") -> None:
         self._touch()
@@ -2720,6 +3654,67 @@ class PetApp:
         else:
             self.bubble.show(f"QQ 桥在跑：{bridge.base_url}（只聊天、不动电脑）", 3600)
 
+    def _maybe_sing(self, text: str, on_reply=None) -> bool:
+        """「唱首歌/哼一段」不走大模型，直接从歌本里挑一首放；返回是否已处理。"""
+        if not re.search(r"唱歌|唱首|唱个|唱一段|来一首|哼一段|哼首|哼个", str(text or "")):
+            return False
+        song = self.songbook.pick(str(text or ""))
+        if song is None:
+            self.bubble.show("呜……歌本还是空的，等本鲸学会唱再给你听。", 3600)
+            return True
+        self._touch()
+        self._last_user_text = str(text or "")
+        reply = f"好呀，本鲸给你哼一段《{song.title}》～"
+        self.bubble.show(reply, 5000)
+        try:
+            self.animator.play(self._state_for("wave"), once=True, then=self._state_for("idle"))
+        except Exception:
+            pass
+        self.voice.speak(preset=song.path)
+        if callable(on_reply):
+            on_reply(reply, "llm")
+        return True
+
+    def sing_song(self) -> None:
+        song = self.songbook.pick("")
+        if song is None:
+            self.bubble.show("歌本还是空的……", 3000)
+            return
+        self._maybe_sing("唱首歌", None)
+
+    # ---------- 抖音助手（读写它的共享人格/日报） ----------
+    def show_douyin_report(self) -> None:
+        try:
+            path = self.douyin.latest_report() if self.douyin else None
+            if path is None:
+                self.bubble.show("抖音助手还没有日报（先让它刷一会儿）。", 3400)
+                return
+            self.bubble.show(self.douyin.report_summary(300) or "日报是空的。", 7000)
+            try:
+                os.startfile(str(path))
+            except Exception:
+                pass
+        except Exception as exc:
+            self.bubble.show(f"读抖音日报失败：{exc}", 3600)
+
+    def sync_douyin_persona(self) -> None:
+        if self.douyin is None:
+            self.bubble.show("没找到抖音助手桥（douyin_bridge.py）。", 3200)
+            return
+        ok, message = self.douyin.sync_persona(BASE / "persona.md")
+        self.bubble.show(message, 6000 if ok else 4200)
+        log(message)
+
+    def show_douyin_status(self) -> None:
+        if self.douyin is None:
+            self.bubble.show("抖音助手桥没接上。", 3200)
+            return
+        pieces = [self.douyin.status_text()]
+        obs = self.douyin.latest_observation() if hasattr(self.douyin, "latest_observation") else None
+        if obs:
+            pieces.append(f"刚看：《{obs['title'][:60]}》")
+        self.bubble.show("｜".join(pieces), 7000)
+
     # ---------- 自主活动 / 全权限 / 记忆查看 ----------
     def toggle_living(self) -> None:
         on = bool(self.roam_var.get())
@@ -2762,9 +3757,22 @@ class PetApp:
             log(f"提醒检查失败：{exc}")
         self.root.after(20000, self._reminder_tick)
 
+    def _summoned(self) -> None:
+        """又双击了一次桌面图标：她跳出来挥挥手（3D 模式下 2D 不出来，3D 会显示气泡）。"""
+        if not self.body3d_var.get():
+            self.root.deiconify()
+            self.root.lift()
+        self._set_emotion("wave", duration_ms=2500)
+        self.bubble.show(random.choice(("我在这儿呢～", "叫本鲸？已经在啦。", "嘿嘿，没走开哦。")), 3200)
+
+    def _state_for_body(self) -> dict:
+        """3D 身体每 200ms 来取一次状态（HTTP 线程）：顺手记下它还活着，2D 那边据此决定收起还是找回。"""
+        self._body3d_seen = time.time()
+        return self._pet_state
+
     def _pet_event(self, kind: str) -> bool:
         """3D 身体上的点击（在 HTTP 线程里调用，切回主线程执行）。"""
-        actions = {"pat": self.pat, "open_chat": self.open_chat,
+        actions = {"pat": self.pat, "open_chat": self.open_chat, "summon": self._summoned,
                    "back_2d": lambda: (self.body3d_var.set(False), self.toggle_body3d())}  # 3D 窗口右键「回到 2D」
         if kind.startswith("feed:"):
             food = kind.split(":", 1)[1]
@@ -2777,26 +3785,90 @@ class PetApp:
 
     def toggle_body3d(self) -> None:
         if self.body3d_var.get():
-            start = BASE.parent / "body3d" / "start.bat"
-            if not start.exists():
-                self.body3d_var.set(False)
-                self.bubble.show("3D 身体还没装好（body3d/）", 3000)
-                return
-            if self.shared_server is None:
-                self.start_shared_brain()  # 3D 身体靠共用大脑接口拿状态
-            import subprocess
-            self._body3d_proc = subprocess.Popen(["cmd", "/c", str(start)], cwd=str(start.parent),
-                                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            self.root.withdraw()
-            log("3D 身体已启动，2D 窗口收起")
+            self._start_body3d()
         else:
-            proc = getattr(self, "_body3d_proc", None)
-            if proc is not None:
-                import subprocess
-                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+            self._stop_body3d("3D 身体已关闭，回到 2D")
+
+    def _start_body3d(self, no_sandbox: bool = False) -> None:
+        """启动 3D 身体。等它真的连上大脑（开始取状态）才收起 2D；起不来/中途退出就自动回 2D。
+
+        不再用 cmd /c start.bat：路径里有中文时 cmd 会把路径转坏、找不到文件，之前因此 2D 收了、3D 没出来，桌面上什么都没有。
+        """
+        import shutil
+        import subprocess
+        body = BASE.parent / "body3d"
+        tools = BASE.parent / ".tools"
+        cli = body / "node_modules" / "electron" / "cli.js"
+        node = tools / "node" / "node.exe"
+        node_cmd = str(node) if node.exists() else shutil.which("node")
+        if not cli.exists() or not node_cmd:
+            self.body3d_var.set(False)
+            self.bubble.show("3D 身体还没装好（body3d/ 里要先 npm ci）", 3600)
+            return
+        if self.shared_server is None:
+            self.start_shared_brain()  # 3D 身体靠共用大脑接口拿状态
+        env = dict(os.environ)
+        if (tools / "tmp").exists() or tools.exists():
+            (tools / "tmp").mkdir(parents=True, exist_ok=True)
+            env.update(TEMP=str(tools / "tmp"), TMP=str(tools / "tmp"))
+        try:
+            extra = os.environ.get("DFY_BODY3D_ARGS", "").split()  # 仅测试用
+            if no_sandbox and "--no-sandbox" not in extra:
+                extra.append("--no-sandbox")
+            self._body3d_no_sandbox = no_sandbox
+            self._body3d_proc = subprocess.Popen([node_cmd, str(cli), ".", *extra], cwd=str(body), env=env,
+                                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as exc:
+            self.body3d_var.set(False)
+            self.bubble.show(f"3D 身体启动失败：{exc}", 4000)
+            return
+        self._body3d_started = time.time()
+        self._body3d_seen = 0.0
+        self.bubble.show("本鲸换个 3D 身体，等一下下……", 4000)
+        log("3D 身体启动中（等它连上大脑再收起 2D）")
+        self.root.after(1000, self._watch_body3d)
+
+    def _watch_body3d(self) -> None:
+        """每秒看一眼 3D 身体：连上了就收起 2D；没起来、退出了或卡住了就回 2D，绝不让桌面上空着。"""
+        proc = getattr(self, "_body3d_proc", None)
+        if proc is None:
+            return
+        now = time.time()
+        seen = getattr(self, "_body3d_seen", 0.0)
+        if proc.poll() is not None:
+            code = proc.returncode & 0xFFFFFFFF
+            if code == 0x80000003 and not getattr(self, "_body3d_no_sandbox", False):
+                # Chromium 沙箱起不来（桌宠被受限环境启动时会这样，实测退出码 0x80000003）：关掉沙箱重试一次。
+                # 3D 窗口只加载本机文件、CSP 只许本机资源，不开网页，关沙箱风险很低。
+                log("3D 身体：Chromium 沙箱起不来，关掉沙箱重试")
                 self._body3d_proc = None
+                self._start_body3d(no_sandbox=True)
+                return
+            self._stop_body3d(f"3D 身体退出了（代码 {proc.returncode}），先回 2D")
+            return
+        if not seen and now - self._body3d_started > 15:
+            self._stop_body3d("3D 身体 15 秒都没起来，先回 2D")
+            return
+        if seen and now - seen > 5:
+            self._stop_body3d("3D 身体好像卡住了，先回 2D")
+            return
+        if seen and self.root.state() != "withdrawn":
+            self.root.withdraw()
+            log("3D 身体已连上，2D 窗口收起")
+        self.root.after(1000, self._watch_body3d)
+
+    def _stop_body3d(self, reason: str) -> None:
+        import subprocess
+        proc = getattr(self, "_body3d_proc", None)
+        self._body3d_proc = None
+        if proc is not None and proc.poll() is None:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+        self.body3d_var.set(False)
+        if self.root.state() == "withdrawn" and not self.hidden:
             self.root.deiconify()
-            log("3D 身体已关闭，回到 2D")
+        log(reason)
+        if "关闭" not in reason:
+            self.bubble.show(reason, 4000)
 
     def open_home(self) -> None:
         home = DATA_DIR / "home"
@@ -2877,6 +3949,10 @@ class PetApp:
             return
         if note:
             log(f"相处笔记更新：{note[:120]}")
+            try:
+                save_note(home_root(BASE), "notes", note, title="相处笔记")
+            except Exception:
+                pass
             self.root.after(0, lambda: self.bubble.show("我把最近学到的记在小本本上了～", 3200))
 
     def open_learned_notes(self) -> None:
@@ -2939,7 +4015,7 @@ class PetApp:
             log(f"共用大脑模块不可用：{exc}")
             return
         server = SharedBrainServer(self.brain, self.config, log=log)
-        server.state_provider = lambda: self._pet_state  # 主线程每 200ms 刷新，这里只读引用
+        server.state_provider = self._state_for_body  # 主线程每 200ms 刷新快照，这里只读引用
         server.event_handler = self._pet_event
         ok, message = server.start()
         if ok:
@@ -2971,6 +4047,19 @@ class PetApp:
             pass
         self.bubble.show(f"接口地址已复制：{url}（model=dfy-companion）", 5000)
 
+    def open_avatar_overlay(self) -> None:
+        script = BASE.parent / "tools" / "launch_avatar_overlay.ps1"
+        if not script.exists():
+            self.open_avatar()
+            return
+        try:
+            import subprocess
+            subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                              "-File", str(script)], creationflags=0x08000000)
+            self.bubble.show("2D 悬浮层在打开啦（Chrome 置顶小窗）", 3600)
+        except Exception as exc:
+            self.bubble.show(f"悬浮层没起来：{exc}", 4200)
+
     def open_web_chat(self) -> None:
         server = self.shared_server
         if server is None or not getattr(server, "running", False):
@@ -2981,6 +4070,19 @@ class PetApp:
             import webbrowser
             webbrowser.open(url)
             self.bubble.show(f"网页聊天打开啦：{url}", 4000)
+        except Exception as exc:
+            self.bubble.show(f"打不开浏览器：{exc}（地址是 {url}）", 5000)
+
+    def open_avatar(self) -> None:
+        server = self.shared_server
+        if server is None or not getattr(server, "running", False):
+            self.bubble.show("2D 形象页没开：共用大脑接口没起来。", 3400)
+            return
+        url = getattr(server, "base_url", "http://127.0.0.1:8765/v1").replace("/v1", "/avatar")
+        try:
+            import webbrowser
+            webbrowser.open(url)
+            self.bubble.show(f"2D 虚拟形象打开啦：{url}", 4200)
         except Exception as exc:
             self.bubble.show(f"打不开浏览器：{exc}（地址是 {url}）", 5000)
 
@@ -3140,7 +4242,7 @@ class PetApp:
         if picked:
             text, path = picked
             self.bubble.show(text)
-            self.voice.speak(preset=path)
+            self._speak_preset(text, path)
         else:
             text = self.brain.line_for_dsh_state(state) or random.choice(fallback)
             self.bubble.show(text)
@@ -3224,6 +4326,8 @@ class PetApp:
 
     # ---------- 大脑 ----------
     def ask(self, text: str, on_reply=None) -> None:
+        if self._maybe_sing(text, on_reply):
+            return
         self.brain.live_context = self.live_context()
         note = self._reminder_note(text)
         if note:
@@ -3318,6 +4422,670 @@ class PetApp:
             return
         self.settings_window = SettingsWindow(self)
 
+    # ---------- 桌面原生整合（托盘 / 自启 / 穿透 / 透明度） ----------
+    def _start_tray(self) -> None:
+        if not self.config.get("tray_enabled", True):
+            return
+        self.config["autostart"] = autostart_enabled()
+        self.tray_service = TrayService(self)
+        if self.tray_service.start():
+            log("系统托盘：已启动")
+        else:
+            self.tray_service = None
+            log("系统托盘：未启动（pystray 不可用或托盘被占用）")
+
+    def toggle_visible(self) -> None:
+        try:
+            if self.root.state() == "withdrawn":
+                self.root.deiconify()
+                self.root.attributes("-topmost", bool(self.config.get("always_on_top", True)))
+                self._resume_after_hidden()
+            else:
+                self._pause_for_hidden()
+                self.root.withdraw()
+        except Exception:
+            pass
+
+    def _pause_for_hidden(self) -> None:
+        """隐藏时停掉动画定时器，别让透明窗在后台空转。"""
+        if self._hidden_paused:
+            return
+        self._hidden_paused = True
+        try:
+            self.animator.stop()
+        except Exception:
+            pass
+
+    def _resume_after_hidden(self) -> None:
+        if not self._hidden_paused:
+            return
+        self._hidden_paused = False
+        try:
+            self.animator.play(self.library.best("idle"))
+        except Exception:
+            pass
+
+    def _start_hotkeys(self) -> None:
+        if not self.config.get("hotkeys_enabled", True):
+            return
+        self.hotkey_service = HotkeyService(self._hotkey_queue.put, log=log)
+        if self.hotkey_service.start():
+            log("全局快捷键：Ctrl+Alt+M 显示/隐藏 / J 聊天 / P 鼠标穿透")
+        else:
+            self.hotkey_service = None
+            log("全局快捷键：注册失败（可能被其他程序占用）")
+
+    def _poll_hotkeys(self) -> None:
+        try:
+            while True:
+                action = self._hotkey_queue.get_nowait()
+                self._handle_hotkey(action)
+        except queue.Empty:
+            pass
+        try:
+            self.root.after(160, self._poll_hotkeys)
+        except Exception:
+            pass
+
+    def _handle_hotkey(self, action: str) -> None:
+        if action == "show_hide":
+            self.toggle_visible()
+        elif action == "chat":
+            self.root.deiconify()
+            self._resume_after_hidden()
+            self.open_chat()
+        elif action == "passthrough":
+            self.set_click_through(not self.config.get("click_through", False))
+
+    def show_hotkeys(self) -> None:
+        self.bubble.show("全局快捷键：" + "；".join(hotkey_labels()), 6200)
+
+    def show_tray_hint(self) -> None:
+        self.bubble.show("托盘图标在任务栏右下角；右键可显示/隐藏、关鼠标穿透、退出。", 4800)
+
+    def toggle_click_through(self) -> None:
+        self.set_click_through(bool(self.click_through_var.get()))
+
+    def set_click_through(self, enabled: bool) -> None:
+        if enabled and not (self.tray_service and self.tray_service.icon):
+            self.config["click_through"] = False
+            try:
+                self.click_through_var.set(False)
+            except Exception:
+                pass
+            self.bubble.show("托盘没起来，鼠标穿透会点不回来，先不开了。", 4200)
+            return
+        ok = click_through(self.root, enabled)
+        self.config["click_through"] = bool(enabled and ok)
+        try:
+            self.click_through_var.set(self.config["click_through"])
+        except Exception:
+            pass
+        self.save_config()
+        if ok:
+            self.bubble.show("鼠标穿透开了；从托盘菜单可以关。" if enabled else "鼠标穿透关了。", 3600)
+        else:
+            self.bubble.show("鼠标穿透没设置成功（仅 Windows 支持）。", 3600)
+
+    def toggle_autostart(self) -> None:
+        want = bool(self.autostart_var.get())
+        ok = set_autostart(want, BASE / "app.py")
+        self.config["autostart"] = bool(ok and want)
+        self.autostart_var.set(self.config["autostart"])
+        self.save_config()
+        self.bubble.show("开机自启开了。" if self.config["autostart"] else "开机自启关了。", 3200)
+
+    def toggle_lock_position(self) -> None:
+        self.config["lock_position"] = bool(self.lock_position_var.get())
+        self.save_config()
+        self.bubble.show("位置锁住了，点她还是有反应。" if self.config["lock_position"] else "位置解锁了。", 3200)
+
+    def toggle_shift_drag(self) -> None:
+        self.config["shift_drag_only"] = bool(self.shift_drag_var.get())
+        self.save_config()
+        self.bubble.show("现在要按住 Shift 才拖得动。" if self.config["shift_drag_only"] else "现在可以直接拖了。", 3400)
+
+    def toggle_free_placement(self) -> None:
+        self.config["free_placement"] = bool(self.free_place_var.get())
+        self.save_config()
+        if self.config["free_placement"]:
+            self.bubble.show("自由摆放：放到哪停哪，不会自己掉下去，也不会自己走。", 4200)
+        else:
+            self.bubble.show("恢复桌面生活：她会自己走、从半空掉到窗口/任务栏上。", 4200)
+            if self._living_on():
+                self.living.dropped()
+
+    def _cleanup_old_screens(self) -> None:
+        try:
+            removed = cleanup_screens(DATA_DIR / "cache" / "screens", keep=4, max_age_hours=24)
+            if removed:
+                log(f"截图清理：删了 {removed} 张旧图")
+        except Exception:
+            pass
+
+    def configure_vision(self) -> None:
+        """视觉模型设置：端点/模型写 config，Key 写 .secret_vision_key。"""
+        win = tk.Toplevel(self.root)
+        win.title("小鲸鱼 · 视觉模型设置")
+        win.geometry("520x250")
+        win.attributes("-topmost", True)
+        cfg = self.config.setdefault("vision", {})
+        tk.Label(win, text="OpenAI 兼容视觉模型（留空则只用前台窗口文字，不发送截图）",
+                 font=("Microsoft YaHei", 10), anchor="w").pack(fill="x", padx=16, pady=(14, 6))
+        form = tk.Frame(win)
+        form.pack(fill="x", padx=16)
+        fields = {}
+        for row, (key, label, value) in enumerate((
+                ("base_url", "接口地址", cfg.get("base_url", "")),
+                ("model", "模型名", cfg.get("model", "")),
+                ("api_key", "API Key", ""))):
+            tk.Label(form, text=label, font=("Microsoft YaHei", 9)).grid(row=row, column=0, sticky="w", pady=4)
+            entry = tk.Entry(form, width=46, show="*" if key == "api_key" else "")
+            entry.insert(0, str(value))
+            entry.grid(row=row, column=1, sticky="we", padx=8, pady=4)
+            fields[key] = entry
+        form.columnconfigure(1, weight=1)
+        tip = tk.Label(win, text="截图只在本机；开启后才会发给这个端点。Key 不写进 Git。",
+                       fg="#66708a", font=("Microsoft YaHei", 8), anchor="w")
+        tip.pack(fill="x", padx=16, pady=(8, 4))
+
+        def save() -> None:
+            cfg["base_url"] = fields["base_url"].get().strip()
+            cfg["model"] = fields["model"].get().strip()
+            key = fields["api_key"].get().strip()
+            if key:
+                try:
+                    (BASE / ".secret_vision_key").write_text(key, encoding="utf-8")
+                except Exception as exc:
+                    self.bubble.show(f"Key 保存失败：{exc}", 3600)
+                    return
+            cfg["enabled"] = bool(cfg["base_url"] and cfg["model"])
+            self.save_config()
+            win.destroy()
+            self.bubble.show("视觉模型设置保存啦。" if cfg["enabled"] else "视觉模型关掉了，只用前台窗口文字。", 3400)
+
+        buttons = tk.Frame(win)
+        buttons.pack(fill="x", padx=16, pady=12)
+        tk.Button(buttons, text="保存", width=10, command=save).pack(side="right")
+        tk.Button(buttons, text="取消", width=10, command=win.destroy).pack(side="right", padx=8)
+
+    def see_screen(self) -> None:
+        """截一张桌面 + 前台窗口，用她的口吻回应；截图只留在本机，按张数/时间清理。"""
+        path = capture_screen(DATA_DIR / "cache" / "screens", keep=4, max_age_hours=24)
+        ctx = screen_context()
+        line = context_line(ctx)
+        self.bubble.show("唔…本鲸瞄一眼。", 1800)
+        if path is None:
+            self.bubble.show(line + "（截图没拍成）", 5200)
+            return
+        self._touch()
+        vision = resolve_vision(self.config, BASE)
+        vision_path = vision_copy(path, path.parent) or path
+
+        def worker() -> None:
+            description = ""
+            # 首选主人自己 API 的 DeepSeek 原生视觉（真实图片输入，无需额外 Key）
+            try:
+                description = self.brain.see_image(
+                    vision_path,
+                    "主人在做什么？屏幕上有什么值得注意的文字或界面？")
+            except Exception:
+                description = ""
+            # 再回退本机 Claude Code CLI
+            if not description:
+                try:
+                    description = claude_see(
+                        path,
+                        "读取这张屏幕截图，用中文客观描述：主人在用什么程序、在做什么、"
+                        "屏幕上值得注意的文字或界面。不要编造看不清的内容，不要复述隐私全文。",
+                        log=log)
+                except Exception:
+                    description = ""
+            # 最后回退用户配置的 OpenAI 兼容视觉模型
+            if not description and vision["ready"]:
+                description = describe_screen_image(
+                    path,
+                    "这是主人的桌面截图。用中文客观描述：主人在用什么程序、在做什么、"
+                    "画面里值得注意的内容。不要编造看不清的字；不要输出隐私细节全文。",
+                    self.config, BASE, log=log)
+            if description:
+                prompt = (f"主人让你看了一眼屏幕。你看到的画面：{description}\n"
+                          f"前台窗口：{line}。用小鲸鱼的口吻自然地回应一句，可以关心或吐槽，"
+                          f"不要编造画面外的事。")
+            else:
+                prompt = (f"主人让你看了一眼屏幕：{line}。你手里有一张本机截图，但视觉读取没成功，"
+                          f"不要编造截图里的具体画面；用小鲸鱼的口吻自然地回应一句，可以问他在做什么。")
+            try:
+                reply, _source = self.brain.reply(prompt)
+            except Exception:
+                reply = f"本鲸看到了：{line}。你在忙什么呀？"
+            self._last_screen_observation = description or line
+            self.root.after(0, self._screen_done, reply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _screen_done(self, reply: str) -> None:
+        self.bubble.show(reply, 7000)
+        try:
+            self.voice.speak(reply)
+        except Exception:
+            pass
+        self._set_emotion("confused", duration_ms=2600)
+        self._remember_visual("看屏幕", self._last_screen_observation)
+        if self.quick_chat is not None and self.quick_chat.winfo_exists():
+            self.quick_chat.append("她（看看屏幕）", reply)
+
+    def _remember_visual(self, kind: str, text: str) -> None:
+        """把一次视觉观察作为「看过的经历」写进记忆；限频，避免刷屏。"""
+        text = str(text or "").strip()
+        if not self.config.get("visual_memory", True) or len(text) < 8:
+            return
+        interval = float(self.config.get("visual_memory_interval", 300) or 300)
+        if time.monotonic() - getattr(self, "_last_visual_memory", 0.0) < interval:
+            return
+        self._last_visual_memory = time.monotonic()
+        try:
+            self.brain.memory_store.add_episode(f"【{kind}】{text[:180]}", start=time.time(), end=time.time())
+            self.brain.memory_store.save()
+        except Exception:
+            pass
+
+    def see_video(self) -> None:
+        """选一段本地视频，抽 6 帧拼成 storyboard，用她的原生视觉理解。"""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="让她看一段视频",
+            filetypes=[("视频", "*.mp4 *.mov *.avi *.mkv *.webm *.m4v"), ("所有文件", "*.*")],
+            parent=self.root)
+        if not path:
+            return
+        self.bubble.show("本鲸看看这段视频……", 1800)
+
+        def worker() -> None:
+            summary = ""
+            try:
+                summary = describe_video(Path(path), self.brain, DATA_DIR / "home" / "videos")
+            except Exception:
+                summary = ""
+            if summary:
+                try:
+                    save_note(home_root(BASE), "videos", summary, title="看视频")
+                except Exception:
+                    pass
+            self.root.after(0, self._video_vision_done, summary or "视频没读出来（可能格式/抽帧失败）。")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _video_vision_done(self, summary: str) -> None:
+        self.bubble.show(summary[:900], 9000)
+        try:
+            self.voice.speak(summary)
+        except Exception:
+            pass
+        self._set_emotion("happy", duration_ms=2600)
+        self._remember_visual("看视频", summary)
+
+    def open_last_screen(self) -> None:
+        path = DATA_DIR / "cache" / "screens" / "screen-last.png"
+        if not path.exists():
+            screens = sorted((DATA_DIR / "cache" / "screens").glob("screen-*.png"),
+                             key=lambda p: p.stat().st_mtime, reverse=True)
+            path = screens[0] if screens else path
+        if not path.exists():
+            self.bubble.show("还没拍过屏幕呢，右键「👀 看看屏幕」先拍一张。", 3600)
+            return
+        try:
+            os.startfile(str(path))
+        except Exception as exc:
+            self.bubble.show(f"截图在这儿：{path}（{exc}）", 5200)
+
+    def see_news(self) -> None:
+        """拉公开新闻标题，让她挑一条聊，并写进自己的小屋。"""
+        self.bubble.show("本鲸去看看今天有什么新闻……", 1800)
+
+        def worker() -> None:
+            items = fetch_headlines(6)
+            if not items:
+                self.root.after(0, lambda: self.bubble.show("新闻源今天连不上，明天再看。", 3600))
+                return
+            prompt = ("这里是今天的新闻标题：\n" + headlines_text(items) +
+                      "\n挑一条你最感兴趣的，用小鲸鱼的口吻说一两句（可以吐槽/好奇），不要逐条念。")
+            try:
+                reply, _ = self.brain.reply(prompt)
+            except Exception:
+                reply = "今天的新闻：" + items[0]["title"]
+            try:
+                root = home_root(BASE)
+                save_note(root, "news", reply, title="今日新闻")
+            except Exception:
+                pass
+            self.root.after(0, self._news_done, reply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _news_done(self, reply: str) -> None:
+        self.bubble.show(reply, 7600)
+        try:
+            self.voice.speak(reply)
+        except Exception:
+            pass
+        self._set_emotion("happy", duration_ms=2400)
+
+    def itunes_action(self, fn) -> None:
+        if fn is None:
+            self.bubble.show("iTunes 控制没接上（需要本机 iTunes + pywin32）。", 4200)
+            return
+        try:
+            message = fn()
+            self.bubble.show(str(message)[:120], 4200)
+        except Exception as exc:
+            self.bubble.show("iTunes 操作失败：" + str(exc)[:220], 5200)
+
+    def itunes_search(self) -> None:
+        from tkinter import simpledialog
+        query = simpledialog.askstring("iTunes 放歌", "想听什么歌？输入歌名/歌手", parent=self.root)
+        if not query:
+            return
+        self.itunes_action(lambda: itunes_search_play(query))
+
+    def itunes_show_now(self) -> None:
+        self.itunes_action(itunes_now_playing)
+
+    def sing_seedvc(self) -> None:
+        """选一段源唱，用 Seed-VC 换成她的音色唱出来。"""
+        if seedvc_convert is None or not seedvc_available():
+            self.bubble.show("Seed-VC 唱歌环境/模型还没就绪。", 4200)
+            return
+        from tkinter import filedialog
+        source = filedialog.askopenfilename(
+            title="选一段源唱/音频给她唱",
+            filetypes=[("音频", "*.wav *.mp3 *.flac *.m4a *.ogg"), ("所有文件", "*.*")],
+            parent=self.root)
+        if not source:
+            return
+        self.bubble.show("本鲸在学这首歌……要加载模型，稍等。", 2600)
+
+        def worker() -> None:
+            try:
+                path = seedvc_convert(Path(source), DATA_DIR / "home" / "songs", log=log)
+                self.root.after(0, lambda: self._seedvc_done(path))
+            except Exception as exc:
+                self.root.after(0, lambda: self.bubble.show("唱歌转换失败：" + str(exc)[:300], 7000))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _seedvc_done(self, path) -> None:
+        self.bubble.show(f"唱好啦：{path.name}（在小屋 songs 里）", 6000)
+        try:
+            self.voice.speak(preset=path)
+        except Exception:
+            pass
+        try:
+            os.startfile(str(path))
+        except Exception:
+            pass
+
+    def sing_seedvc_auto(self) -> None:
+        """她自己找：iTunes 当前曲目优先，否则本机 Music/Downloads 最近一首。"""
+        if seedvc_convert is None or not seedvc_available():
+            self.bubble.show("Seed-VC 唱歌环境/模型还没就绪。", 4200)
+            return
+        if pick_music_source is None:
+            self.bubble.show("找歌源模块没接上。", 3000)
+            return
+        try:
+            source = pick_music_source()
+        except Exception:
+            source = None
+        if not source:
+            self.bubble.show("本鲸没找到歌源：先在 iTunes 放一首，或把音频放进 Music/Downloads。", 5600)
+            return
+        self.bubble.show(f"本鲸自己挑了：{Path(source).name}，开始学唱……", 3200)
+
+        def worker() -> None:
+            try:
+                path = seedvc_convert(Path(source), DATA_DIR / "home" / "songs", log=log)
+                self.root.after(0, lambda: self._seedvc_done(path))
+            except Exception as exc:
+                self.root.after(0, lambda: self.bubble.show("唱歌转换失败：" + str(exc)[:300], 7000))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def netease_play(self) -> None:
+        """网易云公开搜索 + 下载可播放音频，用她的语音队列播放。"""
+        if netease_search is None or netease_download is None:
+            self.bubble.show("网易云接口没接上。", 3200)
+            return
+        from tkinter import simpledialog
+        query = simpledialog.askstring("网易云放歌", "想听什么歌/歌手？", parent=self.root)
+        if not query or not str(query).strip():
+            return
+        query = str(query).strip()[:120]
+        self.bubble.show("本鲸去网易云找找……", 2000)
+
+        def worker() -> None:
+            try:
+                items = netease_search(query, limit=3)
+                if not items:
+                    self.root.after(0, lambda: self.bubble.show("网易云没搜到这首歌。", 3800))
+                    return
+                song = items[0]
+                path = netease_download(song["id"], DATA_DIR / "cache" / "netease")
+                label = f"{song.get('name', '')} — {song.get('artists', '')}".strip(" —")
+                self.root.after(0, lambda: self._netease_done(path, label))
+            except Exception as exc:
+                self.root.after(0, lambda: self.bubble.show("网易云播放失败：" + str(exc)[:260], 5600))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _netease_done(self, path, label: str) -> None:
+        self.bubble.show("正在放：" + label, 4200)
+        try:
+            self.voice.speak(preset=path)
+        except Exception as exc:
+            self.bubble.show("播放失败：" + str(exc)[:220], 4200)
+
+    def research_web(self) -> None:
+        """她上网查公开资料；只读网页，结果写到自己的小屋。"""
+        from tkinter import simpledialog
+        query = simpledialog.askstring("让她上网查资料", "想让她查什么？", parent=self.root)
+        if not query or not str(query).strip():
+            return
+        if self.agent is None:
+            self.bubble.show("Agent 没接上，暂时不能上网查。", 3200)
+            return
+        query = str(query).strip()[:300]
+        self.bubble.show("本鲸去网上翻翻……", 1800)
+
+        def worker() -> None:
+            prompt = (f"请上网查一下：{query}。使用 web_search 找公开资料，必要时用 web_fetch 读正文。"
+                      f"用简短中文总结关键发现（最多 10 行），并指出不确定的地方。不要编造来源。")
+            try:
+                result = self.agent.run(prompt)
+                reply = str(result.get("reply") or "").strip()
+            except Exception as exc:
+                reply = f"查资料失败：{exc}"
+            if reply:
+                try:
+                    save_note(home_root(BASE), "research", reply, title="上网查资料")
+                except Exception:
+                    pass
+            self.root.after(0, self._research_done, reply or "这次没查到有用的东西。")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _research_done(self, reply: str) -> None:
+        self.bubble.show(reply[:900], 10000)
+        try:
+            self.voice.speak(reply)
+        except Exception:
+            pass
+
+    def generate_video(self) -> None:
+        """Seedance 文生视频：需要 ARK_API_KEY；异步任务，完成下载到小屋。"""
+        from tkinter import simpledialog
+        key = resolve_ark_key(BASE, self.config)
+        if not key:
+            self.bubble.show("生成视频要火山方舟 Seedance Key：把 Key 写进 pet/.secret_ark_key，"
+                             "或设环境变量 ARK_API_KEY，再点我。", 7600)
+            return
+        prompt = simpledialog.askstring(
+            "让她生成视频",
+            "想生成什么视频？（Seedance 文生视频，默认 5 秒 720p）",
+            parent=self.root)
+        if not prompt or not str(prompt).strip():
+            return
+        prompt = str(prompt).strip()[:1000]
+        self.bubble.show("本鲸去生成视频啦，可能要等几分钟……", 2600)
+
+        def worker() -> None:
+            try:
+                task = create_video_task(prompt, key, self.config)
+                task_id = str(task.get("id") or "")
+                if not task_id:
+                    raise ValueError(str(task.get("error") or "没有返回任务 ID"))
+                self.root.after(0, lambda: self.bubble.show(f"视频任务已创建：{task_id[:18]}… 等它生成", 4200))
+                result = wait_video_task(task_id, key, timeout=600, log=log)
+                status = str(result.get("status") or "")
+                if status != "succeeded":
+                    message = str((result.get("error") or {}).get("message") or status or "失败")
+                    self.root.after(0, lambda: self.bubble.show("视频没生成成功：" + message[:300], 6200))
+                    return
+                url = str(((result.get("content") or {}).get("video_url")) or "")
+                if not url:
+                    self.root.after(0, lambda: self.bubble.show("视频好了，但没拿到下载地址。", 4800))
+                    return
+                path = download_video(url, DATA_DIR / "home" / "videos")
+                self.root.after(0, lambda: self._video_done(path))
+            except Exception as exc:
+                self.root.after(0, lambda: self.bubble.show("生成视频失败：" + str(exc)[:300], 6200))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _video_done(self, path) -> None:
+        self.bubble.show(f"视频生成好啦：{path.name}（已放进小屋）", 6000)
+        try:
+            os.startfile(str(path))
+        except Exception:
+            pass
+        self._set_emotion("happy", duration_ms=3000)
+
+    def optimize_self(self) -> None:
+        """让她上网找资料，自己写一份优化计划到小屋；不改代码/配置。"""
+        if self.agent is None:
+            self.bubble.show("Agent 没接上，暂时不能自己优化。", 3200)
+            return
+        self.bubble.show("本鲸想想怎么变得更懂你……", 2400)
+
+        def worker() -> None:
+            prompt = ("请先从你的小屋/记忆/相处笔记里看看自己哪里还能更像人、更懂主人；"
+                      "再用 web_search 查 1~2 个公开资料补充想法。最后写一份 5~8 行的优化计划，"
+                      "只写进 pet/home/notes/，不要改代码、配置或主人的文件。")
+            try:
+                result = self.agent.run(prompt)
+                reply = str(result.get("reply") or "").strip()
+            except Exception as exc:
+                reply = f"自我优化失败：{exc}"
+            if reply:
+                try:
+                    save_note(home_root(BASE), "notes", reply, title="自我优化计划")
+                except Exception:
+                    pass
+            self.root.after(0, self._research_done, reply or "这次没想出什么。")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_nest(self) -> None:
+        if self.nest_window is not None and self.nest_window.winfo_exists():
+            self.nest_window.lift()
+            return
+        self.nest_window = NestWindow(self)
+
+    def build_nest(self) -> None:
+        """她自己从家当里挑一件放进窝。"""
+        self.open_nest()
+        nest = self.nest_window
+        if nest is None:
+            return
+        candidates = [item for item in NestWindow.CATALOG if item not in nest.items]
+        if not candidates:
+            self.bubble.show("窝里快放满啦，先让她收拾一下。", 2800)
+            return
+        pick = random.choice(candidates)
+        nest.add_item(pick)
+        self.bubble.show(f"她把「{pick}」放进小窝了。", 3200)
+        self._set_emotion("happy", duration_ms=2200)
+
+    def add_nest_item(self) -> None:
+        from tkinter import simpledialog
+        label = simpledialog.askstring("往她窝里放东西", "放什么？（一个 emoji + 名字）", parent=self.root)
+        if not label:
+            return
+        self.open_nest()
+        if self.nest_window is not None:
+            self.nest_window.add_item(label)
+
+    def reflect_home(self) -> None:
+        """让她整理最近的想法/小屋笔记；只写 pet/home。"""
+        self.bubble.show("本鲸回小屋整理一下……", 1800)
+
+        def worker() -> None:
+            try:
+                recent = self.brain.memory_store.recent_dialogue(12)
+                learned = getattr(self.brain, "learned_notes", "")[-800:]
+            except Exception:
+                recent, learned = "", ""
+            prompt = ("这是你小屋里的近况和最近对话。写一段简短的自我整理（80~160字）："
+                      "可以是今天的心情、想记住的事、或想对主人说的话，不要总结对话。\n"
+                      f"最近对话：\n{recent}\n相处笔记：\n{learned}")
+            try:
+                reply, _ = self.brain.reply(prompt)
+            except Exception:
+                reply = "今天本鲸在桌面上待着，尾巴有点痒，想被摸一下。"
+            path = None
+            try:
+                path = save_note(home_root(BASE), "notes", reply, title="小屋自省")
+            except Exception:
+                pass
+            self.root.after(0, self._reflect_done, reply, path)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _reflect_done(self, reply: str, path) -> None:
+        self.bubble.show(reply, 7200)
+        try:
+            self.voice.speak(reply)
+        except Exception:
+            pass
+        if path:
+            log(f"小屋自省已写入：{path}")
+
+    def set_window_opacity(self, value: float) -> None:
+        value = clamp_opacity(value)
+        self.config["window_opacity"] = value
+        try:
+            self.root.attributes("-alpha", value)
+        except Exception:
+            pass
+        self.save_config()
+        self.bubble.show(f"透明度 {int(value * 100)}%。", 2600)
+
+    def _apply_saved_opacity(self) -> None:
+        value = clamp_opacity(self.config.get("window_opacity", 1.0))
+        if value < 0.999:
+            try:
+                self.root.attributes("-alpha", value)
+            except Exception:
+                pass
+
+    def reset_position(self) -> None:
+        try:
+            self._place_window()
+            self._save_position()
+            self.bubble.show("回到默认位置啦。", 2600)
+        except Exception:
+            pass
+
     # ---------- 启动/退出 ----------
     def _startup(self) -> None:
         if self.config.get("greet_on_start"):
@@ -3325,7 +5093,7 @@ class PetApp:
             if picked:
                 text, path = picked
                 self.bubble.show(text, 6000)
-                self.voice.speak(preset=path)
+                self._speak_preset(text, path)
             else:
                 self.bubble.show(GREETING_FALLBACK, 6000)
                 self.voice.speak(GREETING_FALLBACK)
@@ -3380,6 +5148,16 @@ class PetApp:
         except Exception:
             pass
         try:
+            if getattr(self, "tray_service", None) is not None:
+                self.tray_service.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "hotkey_service", None) is not None:
+                self.hotkey_service.stop()
+        except Exception:
+            pass
+        try:
             self.root.destroy()
         except Exception:
             pass
@@ -3391,9 +5169,35 @@ class PetApp:
             self.quit()
 
 
+def summon_running_instance() -> bool:
+    """已经有一只在跑（共用大脑在线）就叫她出来，自己退出——双击桌面图标不会开出第二只。"""
+    if os.environ.get("DFY_CONFIG"):  # 测试/临时配置不查
+        return False
+    config = load_json(CONFIG_PATH, {})
+    server = config.get("server") if isinstance(config.get("server"), dict) else {}
+    port = int(server.get("port") or 8765)
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.8) as resp:
+            if json.loads(resp.read().decode("utf-8")).get("service") != "dfy-shared-brain":
+                return False
+    except Exception:
+        return False
+    try:  # 叫她出来；旧版本不认识 summon 也没关系——已经有一只在跑，就不开第二只
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/pet/event", data=b'{"kind": "summon"}',
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=2).close()
+    except Exception:
+        pass
+    return True
+
+
 def main() -> None:
     demo = "--demo" in sys.argv
     hidden = "--hidden" in sys.argv
+    if not hidden and summon_running_instance():
+        log("已经有一只在桌面上了：叫她出来，不再开第二只")
+        return
     log("=" * 60)
     log("启动大肥鱼桌宠" + ("（demo）" if demo else "") + ("（hidden）" if hidden else ""))
     app = PetApp(demo=demo, hidden=hidden)

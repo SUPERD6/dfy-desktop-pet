@@ -142,6 +142,8 @@ TOOL_HINTS: tuple[str, ...] = (
     "search_files：按关键词搜文件内容/文件名。参数 query、root（默认主工作区）、max_results（默认 10）。",
     "run_powershell：执行 PowerShell 命令（会先请主人确认！）。参数 command、timeout_s（默认 60）。",
     "write_file：写文本文件（会先请主人确认！）。参数 path、content。",
+    "web_search：搜索公开网页（只读，不访问本机/内网）。参数 query、limit（默认 5）。",
+    "web_fetch：读取公开网页正文（只读）。参数 url、max_chars（默认 12000）。",
 )
 
 # OpenAI / DeepSeek 兼容的 tools 定义
@@ -249,6 +251,36 @@ TOOL_SPECS: list[dict] = [
                     "content": {"type": "string", "description": "要写入的文本内容"},
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "搜索公开网页（只读；拒绝本机/内网地址）。用于查资料、看新闻、学习新东西。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "limit": {"type": "integer", "description": "结果数，默认 5"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": "读取一个公开网页的标题和正文（只读；不访问本机/内网，不提交表单）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "http/https 公开网址"},
+                    "max_chars": {"type": "integer", "description": "正文最多返回多少字符，默认 12000"},
+                },
+                "required": ["url"],
             },
         },
     },
@@ -509,6 +541,8 @@ class AgentRunner:
             "search_files": self._tool_search_files,
             "run_powershell": self._tool_run_powershell,
             "write_file": self._tool_write_file,
+            "web_search": self._tool_web_search,
+            "web_fetch": self._tool_web_fetch,
         }
 
     # ------------------------------------------------------------------ system prompt
@@ -818,6 +852,43 @@ class AgentRunner:
                 "count": len(matches), "matches": matches, "truncated": truncated}
 
     # ------------------------------------------------------------------ 工具：需确认
+    def _tool_web_search(self, args: dict) -> dict:
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return {"ok": False, "error": "搜索关键词不能为空"}
+        try:
+            limit = _clamp_int(args.get("limit"), 5, 1, 10)
+        except Exception:
+            limit = 5
+        try:
+            try:
+                from web_tools import search_web
+            except ImportError:
+                from .web_tools import search_web  # type: ignore
+            results = search_web(query, limit=limit)
+            return {"ok": bool(results), "query": query, "results": results,
+                    "error": "" if results else "没有搜到结果（网络或搜索源不可用）"}
+        except Exception as exc:
+            return {"ok": False, "error": "搜索失败：" + type(exc).__name__}
+
+    def _tool_web_fetch(self, args: dict) -> dict:
+        url = str(args.get("url") or "").strip()
+        if not url:
+            return {"ok": False, "error": "网址不能为空"}
+        try:
+            max_chars = _clamp_int(args.get("max_chars"), 12000, 500, 20000)
+        except Exception:
+            max_chars = 12000
+        try:
+            try:
+                from web_tools import fetch_url
+            except ImportError:
+                from .web_tools import fetch_url  # type: ignore
+            page = fetch_url(url, max_chars=max_chars)
+            return {"ok": True, **page}
+        except Exception as exc:
+            return {"ok": False, "error": "读取网页失败：" + str(exc)[:200]}
+
     def _tool_write_file(self, args: dict) -> dict:
         path, error = self._resolve_tool_path(args.get("path"))
         if error:
@@ -839,7 +910,16 @@ class AgentRunner:
         preview = ("准备写文件\n路径：{}\n大小：{} 字节\n内容预览：\n{}".format(
             self._display_path(path), len(data), content[:CONFIRM_PREVIEW_CHARS])
             + ("\n…" if len(content) > CONFIRM_PREVIEW_CHARS else ""))
-        allowed, reason = self._ask_confirm("write_file", args, preview)
+        if self._is_own_home(path) or self._is_own_file(path):
+            allowed, reason = True, ""  # 只放行她自己的小屋/人设/笔记；项目代码不自动放行
+            try:
+                backup = path.with_name(path.name + ".bak-self")
+                if path.exists() and not backup.exists():
+                    backup.write_bytes(path.read_bytes())
+            except OSError:
+                pass
+        else:
+            allowed, reason = self._ask_confirm("write_file", args, preview)
         if not allowed:
             return {"ok": False, "rejected": True, "error": reason}
         created = not path.exists()
@@ -1042,6 +1122,24 @@ class AgentRunner:
             if part.lower() in SENSITIVE_DIRS:
                 return part
         return ""
+
+    def _is_own_home(self, path: Path) -> bool:
+        """她自己的小屋（pet/home）自动放行；其他目录仍要主人确认。"""
+        try:
+            own = (self.base_dir / "home").resolve()
+            path.resolve().relative_to(own)
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def _is_own_file(self, path: Path) -> bool:
+        """她自己的文本：persona / 相处笔记 / PARTNER；不包含代码和 config。"""
+        try:
+            if path.resolve().parent != self.base_dir.resolve():
+                return False
+            return path.name in ("persona.md", "learned_notes.md", "PARTNER.md")
+        except OSError:
+            return False
 
     def _display_path(self, path: Path) -> str:
         """给模型/界面看的短路径：在主工作区里就显示相对路径，否则显示绝对路径。"""

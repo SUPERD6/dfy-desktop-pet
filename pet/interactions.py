@@ -10,6 +10,28 @@ FEED_LINES = {
 }
 
 DRAG_LINES = ("起飞咯——", "晕鱼了晕鱼了……")
+
+
+def pat_event(count: int) -> str:
+    """把连续点击合成一件事，避免点十几下就回十几句。"""
+    count = max(1, int(count))
+    if count == 1:
+        return "主人轻轻摸了一下头"
+    if count <= 3:
+        return f"主人连着摸了 {count} 下头"
+    if count <= 8:
+        return f"主人有点着急地连戳了 {count} 下，戳得有点多"
+    return f"主人一口气戳了 {count} 下，完全没停"
+
+
+def pat_fallbacks(count: int) -> tuple[str, ...]:
+    count = max(1, int(count))
+    if count <= 1:
+        return ("唔……只能摸一下哦。", "（耳朵缩了缩）才、才没有很舒服。")
+    if count <= 3:
+        return (f"摸 {count} 下就够啦……", "你手速好快，本鲸的耳朵都跟不上了。")
+    return ("别、别戳啦——再戳要漏算力了！", "喂喂，本鲸不是按钮……")
+
 INNER_VOICE_LINES = (
     "这用户发的啥啊，",
     "这也太虐了吧？！我心里堵得慌！！",
@@ -91,7 +113,7 @@ def render_food(food: str, size: int = 64, bites: int = 0):
 def visible_ratio(image) -> float:
     """不透明像素占比：测试用来确认咬一口确实变少了。"""
     alpha = image.getchannel("A")
-    return sum(1 for value in alpha.getdata() if value > 16) / float(image.width * image.height)
+    return sum(1 for value in alpha.tobytes() if value > 16) / float(image.width * image.height)
 
 
 # ---------- 回复里的小动作 → 真的做出来 ----------
