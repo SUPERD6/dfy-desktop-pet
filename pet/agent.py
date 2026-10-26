@@ -46,8 +46,8 @@ DEFAULT_SHARED_ROOT = ""  # 个人库默认不开放；需要时写进 allowed_r
 DEFAULT_STATUS_PATH = "~/.dsh/whale-bridge/status.json"
 
 # 步数上限：任务硬要求最多 6 步（配置只能往小改，不能放大）
-MAX_STEPS = 6
-MAX_API_ROUNDS = 12            # 兜底：模型一直给空 tool_calls 时也一定会停
+MAX_STEPS = 80
+MAX_API_ROUNDS = 100           # 兜底：模型一直给空 tool_calls 时也一定会停
 MAX_TOOL_RESULT_CHARS = 8000   # 单条工具结果进模型上下文的最大字符数
 MAX_READ_BYTES_HARD = 5 * 1024 * 1024   # 超过 5MB 的文本文件不直接读
 MAX_WRITE_BYTES = 200 * 1024             # write_file 内容上限 200KB
@@ -142,6 +142,7 @@ TOOL_HINTS: tuple[str, ...] = (
     "search_files：按关键词搜文件内容/文件名。参数 query、root（默认主工作区）、max_results（默认 10）。",
     "run_powershell：执行 PowerShell 命令（会先请主人确认！）。参数 command、timeout_s（默认 60）。",
     "write_file：写文本文件（会先请主人确认！）。参数 path、content。",
+    "replace_in_file：精确替换文本文件里的一小段（old_text 必须唯一出现）；改代码优先用它。参数 path、old_text、new_text。",
     "web_search：搜索公开网页（只读，不访问本机/内网）。参数 query、limit（默认 5）。",
     "web_fetch：读取公开网页正文（只读）。参数 url、max_chars（默认 12000）。",
 )
@@ -251,6 +252,22 @@ TOOL_SPECS: list[dict] = [
                     "content": {"type": "string", "description": "要写入的文本内容"},
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_in_file",
+            "description": "在文本文件里精确替换一小段（old_text 必须唯一出现）。用于改代码/配置的小补丁，比整文件重写安全。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径"},
+                    "old_text": {"type": "string", "description": "要替换的原文本（必须唯一）"},
+                    "new_text": {"type": "string", "description": "替换成的新文本"},
+                },
+                "required": ["path", "old_text", "new_text"],
             },
         },
     },
@@ -401,7 +418,7 @@ class AgentRunner:
     因此不要并发跑多个 `run()`（app 层本来也是一个气泡一次对话）。
     """
 
-    MUTATING_TOOLS = ("run_powershell", "write_file")
+    MUTATING_TOOLS = ("run_powershell", "write_file", "replace_in_file")
 
     def __init__(self, base_dir: Path, config: dict, personal=None, overview=None,
                  status_path=None, log=print, confirm=None):
@@ -544,6 +561,7 @@ class AgentRunner:
             "search_files": self._tool_search_files,
             "run_powershell": self._tool_run_powershell,
             "write_file": self._tool_write_file,
+            "replace_in_file": self._tool_replace_in_file,
             "web_search": self._tool_web_search,
             "web_fetch": self._tool_web_fetch,
         }
@@ -944,6 +962,64 @@ class AgentRunner:
             return {"ok": False, "error": f"写文件失败：{exc.strerror or exc}"}
         return {"ok": True, "path": self._display_path(path), "bytes": len(data),
                 "created": created}
+
+    def _tool_replace_in_file(self, args: dict) -> dict:
+        """精确替换一小段文本；用于自主改代码，避免整文件重写。"""
+        path, error = self._resolve_tool_path(args.get("path"))
+        if error:
+            return {"ok": False, "error": error}
+        old = args.get("old_text")
+        new = args.get("new_text")
+        if not isinstance(old, str) or not old:
+            return {"ok": False, "error": "old_text 必须是非空字符串"}
+        if not isinstance(new, str):
+            return {"ok": False, "error": "new_text 必须是字符串"}
+        suffix = path.suffix.lower()
+        if suffix not in TEXT_EXTENSIONS:
+            return {"ok": False, "error": f"只允许改文本文件，不写 {suffix or '无扩展名'} 文件"}
+        if not path.is_file():
+            return {"ok": False, "error": f"文件不存在：{self._display_path(path)}"}
+        try:
+            data = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            return {"ok": False, "error": f"读取失败：{exc}"}
+        count = data.count(old)
+        if count != 1:
+            return {"ok": False, "error": f"old_text 在文件里出现 {count} 次，必须正好 1 次"}
+        updated = data.replace(old, new, 1)
+        raw = updated.encode("utf-8")
+        if len(raw) > MAX_WRITE_BYTES:
+            return {"ok": False, "error": f"改后太大（{len(raw)} 字节，上限 {MAX_WRITE_BYTES}）"}
+        preview = ("准备精确替换\n路径：{}\n替换预览：\n{}".format(
+            self._display_path(path), (old[:220] + "  →  " + new[:220])))
+        if self._is_own_home(path) or self._is_own_file(path):
+            allowed, reason = True, ""
+            try:
+                backup = path.with_name(path.name + ".bak-self")
+                if path.exists() and not backup.exists():
+                    backup.write_bytes(path.read_bytes())
+            except OSError:
+                pass
+        else:
+            allowed, reason = self._ask_confirm("replace_in_file", args, preview)
+        if not allowed:
+            return {"ok": False, "rejected": True, "error": reason}
+        try:
+            fd, tmp_name = tempfile.mkstemp(prefix=".dfy-edit-", suffix=".tmp", dir=str(path.parent))
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(raw)
+                os.replace(tmp_name, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        except OSError as exc:
+            return {"ok": False, "error": f"写入失败：{exc}"}
+        return {"ok": True, "path": self._display_path(path), "bytes": len(raw),
+                "replaced_chars": len(old), "new_chars": len(new)}
 
     def _tool_run_powershell(self, args: dict) -> dict:
         command = str(args.get("command") or "").strip()

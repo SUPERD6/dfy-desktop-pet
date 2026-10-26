@@ -2004,10 +2004,14 @@ class PetApp:
         self.config.setdefault("autonomy_enabled", True)
         self.config.setdefault("self_improve_enabled", True)
         self.config.setdefault("self_improve_autonomous", True)
+        self.config.setdefault("self_improve_model_enabled", True)
+        self.config.setdefault("self_improve_home_enabled", True)
         self.config.setdefault("self_improve_interval_min", 30)
+        self.config.setdefault("self_improve_home_interval_min", 60)
         self.config.setdefault("self_improve_estimate_tokens", 0)
         self.config.setdefault("autonomy_daily_limit", 0)
         self.config.setdefault("autonomy_model", "deepseek-v4-pro")
+        self.config.setdefault("position_awareness", True)
         self.config.setdefault("ambient_screen_enabled", True)
         self.config.setdefault("ambient_screen_interval", 300)
         self.config.setdefault("roam_enabled", False)
@@ -2292,6 +2296,9 @@ class PetApp:
             self.root.after(2000, self.open_chat)
         self.root.after(15000, self._autonomy_tick)
         self.root.after(20 * 60 * 1000, self._self_improve_tick)
+        self.root.after(30 * 60 * 1000, self._home_improve_tick)
+        if os.environ.get("DFY_AUTONOMY_ONCE") == "1":
+            self.root.after(8000, self._autonomy_once_startup)
         self.root.after(60 * 1000, self._ambient_screen_tick)
         if not hidden and (self.config.get("wake") or {}).get("enabled"):
             self.root.after(2500, self.start_wake)
@@ -2454,9 +2461,14 @@ class PetApp:
         return bool(finished and result["ok"])
 
     def live_context(self) -> str:
-        """「此刻」一行（≤70 字）：几点、她刚在干嘛、她的状态、主人在干嘛。让她像活在当下，而不是每次从零开始。"""
+        """「此刻」一行：几点、她在哪、刚在干嘛、状态、主人在干嘛。"""
         weekday = "一二三四五六日"[time.localtime().tm_wday]
         parts = [f"周{weekday} {time.strftime('%H:%M')}"]
+        if self.config.get("position_awareness", True):
+            try:
+                parts.append(self._position_summary())
+            except Exception:
+                pass
         living = getattr(self, "living", None)
         if living is not None:
             doing = {"stroll": "在桌面上溜达", "climb_window": "爬到窗口顶上玩", "peek_edge": "躲在屏幕边偷看",
@@ -2492,7 +2504,30 @@ class PetApp:
                 parts.append(f"主人好像在{label}")
         except Exception:
             pass
-        return "；".join(parts)[:160]
+        return "；".join(parts)[:240]
+
+    def _position_changed(self) -> None:
+        """被放到新位置后，更新她自己的位置感；不额外调模型。"""
+        self._last_position_at = time.time()
+        try:
+            self.brain.live_context = self.live_context()
+        except Exception:
+            pass
+
+    def _position_summary(self) -> str:
+        """她自己知道此刻在屏幕的哪里，而不是只有 x/y。"""
+        x = int(self.root.winfo_x())
+        y = int(self.root.winfo_y())
+        sw = max(1, int(self.root.winfo_screenwidth()))
+        sh = max(1, int(self.root.winfo_screenheight()))
+        cx = x + self.W // 2
+        cy = y + self.H // 2
+        px, py = cx / sw, cy / sh
+        col = "左" if px < 0.34 else ("右" if px > 0.66 else "中")
+        row = "上" if py < 0.34 else ("下" if py > 0.66 else "中")
+        edge = min(x, y, sw - (x + self.W), sh - (y + self.H))
+        near = "贴着屏幕边" if edge < 80 else "离屏幕边还有距离"
+        return f"你现在在屏幕{col}{row}部（横向{px:.0%}、纵向{py:.0%}，{near}）"
 
     def _reminder_note(self, text: str) -> str:
         """主人让她提醒：先在本地把提醒排好，再告诉她结果（她就不会空口答应做不到的事）。"""
@@ -2685,6 +2720,7 @@ class PetApp:
                     self._start_flight(vx, vy)
                     return
             self._save_position()
+            self._position_changed()
             if self._living_on():
                 self.living.dropped()  # 放在半空会掉到下面的窗口或任务栏上
         else:
@@ -2881,9 +2917,12 @@ class PetApp:
         home.add_command(label="📂  打开小窝文件夹", command=self.open_home)
         home.add_command(label="🧠  让她整理小屋/自省", command=self.reflect_home)
         home.add_command(label="🧬  自主进化（模型/Agent/能力/外形）…", command=self.autonomy_improve)
-        self.self_auto_var = tk.BooleanVar(value=bool(self.config.get("self_improve_autonomous")))
-        home.add_checkbutton(label="⏱  自动自主进化", variable=self.self_auto_var,
+        self.self_auto_var = tk.BooleanVar(value=bool(self.config.get("self_improve_model_enabled", True)))
+        home.add_checkbutton(label="🧬  模型/能力自主进化", variable=self.self_auto_var,
                              command=self.toggle_self_autonomy)
+        self.home_auto_var = tk.BooleanVar(value=bool(self.config.get("self_improve_home_enabled", True)))
+        home.add_checkbutton(label="🏠  小屋自主优化", variable=self.home_auto_var,
+                             command=self.toggle_home_autonomy)
         evo_menu = tk.Menu(home, tearoff=0, font=("Microsoft YaHei", 9))
         self.autonomy_model_var = tk.StringVar(
             value=str(self.config.get("autonomy_model") or "deepseek-v4-pro"))
@@ -2897,9 +2936,10 @@ class PetApp:
         model_menu.add_radiobutton(label="deepseek-flash（快/省）",
                                    variable=self.autonomy_model_var, value="deepseek-flash",
                                    command=lambda: self.set_autonomy_model("deepseek-flash"))
-        evo_menu.add_cascade(label="🧠 自主进化用的模型", menu=model_menu)
+        evo_menu.add_cascade(label="🧠 模型进化用的模型", menu=model_menu)
         evo_menu.add_separator()
-        evo_menu.add_command(label="⏱ 设置自主进化频率…", command=self.set_autonomy_interval)
+        evo_menu.add_command(label="⏱ 设置模型进化频率…", command=self.set_autonomy_interval)
+        evo_menu.add_command(label="⏱ 设置小屋优化频率…", command=self.set_home_interval)
         evo_menu.add_command(label="🎯 设置单轮 token 上限…", command=self.set_autonomy_round_limit)
         evo_menu.add_command(label="📅 设置每日 token 上限…", command=self.set_autonomy_limit)
         home.add_cascade(label="⚙️  自主进化设置", menu=evo_menu)
@@ -2928,6 +2968,9 @@ class PetApp:
         self.topmost_var = tk.BooleanVar(value=bool(self.config.get("always_on_top", True)))
         look.add_checkbutton(label="📌  窗口置顶", variable=self.topmost_var,
                              command=self.toggle_topmost)
+        self.position_aware_var = tk.BooleanVar(value=bool(self.config.get("position_awareness", True)))
+        look.add_checkbutton(label="📍  让她知道自己在屏幕哪", variable=self.position_aware_var,
+                             command=self.toggle_position_awareness)
         self.body3d_var = tk.BooleanVar(value=False)
         if self.config.get("body3d_menu"):
             look.add_checkbutton(label="🧊  3D 身体（实验）", variable=self.body3d_var,
@@ -3100,6 +3143,13 @@ class PetApp:
         self.save_config()
         self.bubble.show("以后用她的 GPT-SoVITS 声音说话。" if use_new
                          else "先用回晓伊声音（GPT-SoVITS 服务器可留着）。", 3600)
+
+    def toggle_position_awareness(self) -> None:
+        enabled = bool(self.position_aware_var.get())
+        self.config["position_awareness"] = enabled
+        self.save_config()
+        self.bubble.show("好，我会记得自己在屏幕的哪边。" if enabled
+                         else "好，先不记位置了。", 3000)
 
     def toggle_topmost(self) -> None:
         value = bool(self.topmost_var.get())
@@ -3694,6 +3744,22 @@ class PetApp:
         self.save_config()
         self.bubble.show(f"以后每 {value} 分钟自主进化一次。", 3600)
 
+    def set_home_interval(self) -> None:
+        value = self._ask_token_int("小屋优化频率", "每多少分钟整理一次小屋？（10–1440）",
+                                    int(self.config.get("self_improve_home_interval_min", 60) or 60))
+        if value is None:
+            return
+        value = max(10, min(1440, int(value)))
+        self.config["self_improve_home_interval_min"] = value
+        self.save_config()
+        self.bubble.show(f"以后每 {value} 分钟整理一次小屋。", 3600)
+
+    def toggle_home_autonomy(self) -> None:
+        enabled = bool(self.home_auto_var.get())
+        self.config["self_improve_home_enabled"] = enabled
+        self.save_config()
+        self.bubble.show("小屋自主优化开着。" if enabled else "小屋先不由她自己整理。", 3000)
+
     def set_autonomy_model(self, model: str) -> None:
         self.config["autonomy_model"] = str(model or "")
         try:
@@ -4075,14 +4141,27 @@ class PetApp:
             log(f"自主小动作失败：{exc}")
         self.root.after(15000, self._autonomy_tick)
 
+    def _autonomy_once_startup(self) -> None:
+        log("DFY_AUTONOMY_ONCE：启动一次自主进化")
+        topic = str(os.environ.get("DFY_AUTONOMY_TOPIC") or "").strip() or None
+        if topic:
+            log(f"DFY_AUTONOMY_TOPIC：{topic}")
+        threading.Thread(target=self._autonomy_self_improve_worker,
+                         args=(topic,), daemon=True).start()
+
     def _self_improve_tick(self) -> None:
-        if self.config.get("self_improve_enabled", True):
-            if self.config.get("self_improve_autonomous"):
-                threading.Thread(target=self._autonomy_self_improve_worker, daemon=True).start()
-            else:
-                threading.Thread(target=self._self_improve_worker, daemon=True).start()
+        """模型/能力自主进化：单独计时，不和小屋整理混在一起。"""
+        if self.config.get("self_improve_enabled", True) and self.config.get("self_improve_model_enabled", True):
+            threading.Thread(target=self._autonomy_self_improve_worker, daemon=True).start()
         minutes = max(10, int(self.config.get("self_improve_interval_min", 30) or 30))
         self.root.after(minutes * 60 * 1000, self._self_improve_tick)
+
+    def _home_improve_tick(self) -> None:
+        """小屋自主优化：只整理小屋/相处笔记，不碰代码和模型。"""
+        if self.config.get("self_improve_enabled", True) and self.config.get("self_improve_home_enabled", True):
+            threading.Thread(target=self._self_improve_worker, daemon=True).start()
+        minutes = max(10, int(self.config.get("self_improve_home_interval_min", 60) or 60))
+        self.root.after(minutes * 60 * 1000, self._home_improve_tick)
 
     def _autonomy_self_improve_worker(self, topic: str | None = None) -> None:
         """让她自己上网查、改自己的代码/2D/3D/声音/小屋，并用测试保护。"""
@@ -4096,7 +4175,7 @@ class PetApp:
             "外形/2D/3D/动作": "看看 2D 角色包、body3d、动画/表情/镜头，优化你自己的外形、动作或待机表现；能跑 smoke 就验证。",
             "大脑/记忆/人格": "读 brain.py、persona、memory 和最近的相处记录，改进你的记忆、说话方式或自我认知；改完跑测试。",
             "启动/性能/桌面体验": "看看启动流程、卡顿、窗口/托盘/菜单，挑一个实际的性能和体验问题修掉。",
-            "小屋/生活/活人感": "看看 pet/home、生活状态、看屏幕和主动行为，让你更像有自己的生活，但不刷屏。",
+            "屏幕位置感/活人感": "优化你对自己在屏幕上的位置、窗口边缘、桌面空间的理解，让你更像活在桌面上。",
         }
         chosen = topic or random.choice(list(topics))
         goal = topics.get(chosen, topics["Agent 能力/工具/权限"])
@@ -4130,7 +4209,10 @@ class PetApp:
                 "4) 如果失败，用备份恢复并如实报告；不要改测试来假装通过。\n"
                 "5) 绝对不要读/改 个人配置、密钥文件、其他个人数据；不要外发、不要 git push、"
                 "不要删除项目以外的东西；不要为了通过测试削弱安全/隐私边界。\n"
-                "6) 最后用中文写 5~10 行：你给自己加了什么能力、改了哪些文件、怎么验证、下一步想做什么。"
+                "6) 最后用中文写 5~10 行：你给自己加了什么能力、改了哪些文件、怎么验证、下一步想做什么。\n"
+                "效率要求：不要一次读整个文件；先用 search_files 定位，再用 read_file 只读相关段。"
+                "改代码优先用 replace_in_file，不要整文件重写。"
+                "最多 80 步，但目标应在 30 步内完成；每 8 步至少要有一次写入或测试；不要一直只读。"
             )
             result = self.agent.run(prompt, purpose="self_improve",
                                     model=(str(self.config.get("autonomy_model") or "").strip() or None))
@@ -4157,12 +4239,13 @@ class PetApp:
     def toggle_self_autonomy(self) -> None:
         enabled = bool(self.self_auto_var.get())
         self.config["self_improve_autonomous"] = enabled
+        self.config["self_improve_model_enabled"] = enabled
         self.save_config()
         if enabled:
             self.bubble.show("好，我每 30 分钟自己查资料、改一点自己的模型/能力/外形；token 不够会停。", 4600)
             threading.Thread(target=self._autonomy_self_improve_worker, daemon=True).start()
         else:
-            self.bubble.show("先不自己改了，等我叫你。", 2800)
+            self.bubble.show("模型/能力先不自己改了，等我叫你。", 2800)
 
     def _self_improve_worker(self) -> None:
         try:

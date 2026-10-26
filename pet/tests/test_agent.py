@@ -990,7 +990,8 @@ class ToolSpecTests(unittest.TestCase):
         self.assertEqual(len(set(names)), len(names), msg="工具名不能重复")
 
     def test_mutating_tools_are_marked(self) -> None:
-        self.assertEqual(set(agent.AgentRunner.MUTATING_TOOLS), {"run_powershell", "write_file"})
+        self.assertEqual(set(agent.AgentRunner.MUTATING_TOOLS),
+                         {"run_powershell", "write_file", "replace_in_file"})
 
 
 if __name__ == "__main__":
