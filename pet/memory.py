@@ -44,6 +44,9 @@ CONSOLIDATE_BATCH = 20      # 每次压缩多少条
 EPISODES_LIMIT = 200        # 日记最多留多少条，超了把最旧的几条并成一条
 EPISODE_MERGE = 8
 RECALL_THRESHOLD = 0.6      # 证据门槛：相关度（含鲜活度折扣）低于它的事实不往 prompt 里塞
+# 语义召回（nn-3，有向量模型时）：相似度够高、且在所有记忆里明显突出才算想起来（2026-10-28 用 10 条样例校准）
+SEMANTIC_MIN = 0.48
+SEMANTIC_Z = 2.0
 FACTS_PER_DAY = 8           # 每天自动记事实的上限（主人明确说「记住」的不算）
 
 # 常见的单字虚词：参与打分容易误命中，单字 token 直接忽略（2-gram 仍保留一部分）
@@ -172,6 +175,7 @@ class MemoryStore:
         self.data: dict = {}
         self.dirty = False
         self.last_recall: dict = {}
+        self.embedder = None  # 语义召回用的小向量模型（embedder.Embedder），由 app 挂上；没有就只用关键词
         self._load()
 
     # ---------- 读取与自愈 ----------
@@ -335,6 +339,8 @@ class MemoryStore:
                         pass  # 备份失败不影响主流程
                 os.replace(tmp, self.path)
                 self.dirty = False
+                if self.embedder is not None:  # 向量缓存只留还记得的事
+                    self.embedder.save(keep={str(f.get("text", "")) for f in self.facts})
                 return True
             except Exception as exc:
                 self.log(f"记忆保存失败：{exc}")
@@ -552,8 +558,10 @@ class MemoryStore:
         scored: list[tuple[float, float, dict]] = []
         recall: list[dict] = []  # 这次召回的明细（给记忆面板看：挑了谁、没挑谁、为什么）
         now = _now()
+        semantic = self._semantic_scores(query)
         for fact in self.active_facts:
             raw = relevance_score(query_tokens, tokenize(fact.get("text", "")))
+            raw = max(raw, semantic.get(fact.get("text", ""), 0.0))  # 关键词没沾边，意思相近也算
             if raw <= 0:
                 continue
             fresh = freshness(fact, now)
@@ -602,6 +610,29 @@ class MemoryStore:
         self.last_recall = {"query": query[:60], "time": now,
                             "items": sorted(recall, key=lambda e: -e["score"])[:12]}
         return result
+
+    def _semantic_scores(self, query: str) -> dict[str, float]:
+        """用小向量模型给每条有效事实打「意思相近」分，换算到和关键词分同一量级；没模型时返回空。"""
+        embedder = getattr(self, "embedder", None)
+        if embedder is None or not getattr(embedder, "available", False):
+            return {}
+        texts = [str(f.get("text", "")) for f in self.active_facts if f.get("text")]
+        if not texts:
+            return {}
+        try:
+            sims = embedder.similarities(query, texts)
+        except Exception as exc:
+            self.log(f"语义召回失败，退回关键词：{exc}")
+            return {}
+        mean = sum(sims) / len(sims)
+        std = (sum((x - mean) ** 2 for x in sims) / len(sims)) ** 0.5
+        out = {}
+        for text, sim in zip(texts, sims):
+            # 事实太少时没法看「突出」，只认很高的相似度
+            standout = (sim - mean) / std >= SEMANTIC_Z if len(texts) >= 5 and std > 1e-6 else sim >= 0.62
+            if sim >= SEMANTIC_MIN and standout:
+                out[text] = RECALL_THRESHOLD + (sim - SEMANTIC_MIN) * 2
+        return out
 
     def relevant_lines(self, query: str, limit: int = RELEVANT_LIMIT) -> list[str]:
         """检索结果转成给 prompt 用的短句。"""

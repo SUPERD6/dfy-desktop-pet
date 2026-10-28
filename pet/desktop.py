@@ -171,6 +171,28 @@ if sys.platform == "win32":
         except Exception:
             return ""
 
+    def visible_window_titles() -> list[str]:
+        """所有可见、没最小化的顶层窗口标题（截图前查有没有敏感窗口；包括桌宠自己以外的小窗）。"""
+        return [w.title for w in list_windows()]
+
+    def foreground_monitor_rect() -> tuple[int, int, int, int] | None:
+        """前台窗口所在那块显示器的范围：截图只截这一块，不把别的屏幕也拍进去。"""
+        class _MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", _RECT), ("rcWork", _RECT),
+                        ("dwFlags", wintypes.DWORD)]
+
+        try:
+            _user32.MonitorFromWindow.restype = ctypes.c_void_p
+            monitor = _user32.MonitorFromWindow(_user32.GetForegroundWindow(), 2)  # MONITOR_DEFAULTTONEAREST
+            info = _MONITORINFO()
+            info.cbSize = ctypes.sizeof(info)
+            if monitor and _user32.GetMonitorInfoW(ctypes.c_void_p(monitor), ctypes.byref(info)):
+                r = info.rcMonitor
+                return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+        return None
+
     def cursor_pos() -> tuple[int, int] | None:
         """鼠标在屏幕上的位置（只读位置，不装全局钩子、不记按键）。"""
         point = wintypes.POINT()
@@ -200,6 +222,12 @@ else:  # 非 Windows：没有窗口平台，只有地面
 
     def foreground_title() -> str:
         return ""
+
+    def visible_window_titles() -> list[str]:
+        return []
+
+    def foreground_monitor_rect():
+        return None
 
     def window_rect(hwnd: int):
         return None

@@ -74,6 +74,19 @@ class AppetiteTest(unittest.TestCase):
         self.assertEqual(a.data["history"][-1]["eaten"], 1900)
         self.assertIn("今天吃了", a.summary())
 
+    def test_add_allowance_increases_allowance_and_fed_total(self):
+        a = fresh(daily=0)
+        before_allowance = a.allowance
+        before_fed = int(a.data.get("fed_total", 0))
+        self.assertEqual(a.add_allowance(500), 500)
+        self.assertEqual(a.allowance, before_allowance + 500)
+        self.assertEqual(int(a.data.get("fed_total", 0)), before_fed + 500)
+
+    def test_set_allowance_sets_exactly(self):
+        a = fresh(daily=0)
+        self.assertEqual(a.set_allowance(321), 321)
+        self.assertEqual(a.allowance, 321)
+
 
 if __name__ == "__main__":
     unittest.main()

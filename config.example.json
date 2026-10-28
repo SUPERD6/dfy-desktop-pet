@@ -20,9 +20,10 @@
   },
   "agent": {
     "enabled": true,
-    "allowed_roots": [],
-    "auto_approve": false
+    "allowed_roots": []
   },
+  "self_improve_enabled": false,
+  "ambient_screen_enabled": false,
   "proactive": {
     "enabled": true
   },

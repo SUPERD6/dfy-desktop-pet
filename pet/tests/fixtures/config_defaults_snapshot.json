@@ -1,0 +1,148 @@
+{
+ "agent": {
+  "allowed_roots": [
+   "<PROJECT>"
+  ],
+  "auto_approve_own_home": true,
+  "enabled": true,
+  "max_steps": 6
+ },
+ "always_on_top": true,
+ "ambient_screen_enabled": false,
+ "ambient_screen_interval": 300,
+ "asr_backend": "sensevoice",
+ "autonomy_daily_limit": 0,
+ "autonomy_enabled": true,
+ "autonomy_max_steps": 24,
+ "autonomy_model": "deepseek-v4-pro",
+ "autostart": false,
+ "barge_in_enabled": true,
+ "chat_open_on_start": false,
+ "click_jump": true,
+ "click_sound": true,
+ "click_sound_style": "duck",
+ "click_through": false,
+ "double_click_chat": false,
+ "dsh_status": {
+  "enabled": true,
+  "path": "~/.dsh/whale-bridge/status.json",
+  "poll_ms": 1000
+ },
+ "feed_counts": {
+  "apple": 0,
+  "cake": 0,
+  "carrot": 0,
+  "diamond": 0,
+  "fish": 0,
+  "plant": 0,
+  "rice": 0,
+  "seaweed": 0,
+  "tangyuan": 0
+ },
+ "free_placement": true,
+ "gptsovits": {
+  "base_url": "http://127.0.0.1:9880",
+  "prompt_lang": "zh",
+  "prompt_text": "本鲸叫小鲸鱼，最喜欢白饭和主人的摸头。",
+  "ref_audio_path": "cache/gptsovits/ref.wav",
+  "text_lang": "zh",
+  "text_split_method": "cut5"
+ },
+ "greet_on_start": true,
+ "hotkeys_enabled": true,
+ "inner_voice_chance": 0.16666666666666666,
+ "llm": {},
+ "lock_position": false,
+ "mute": false,
+ "overview": {
+  "enabled": true,
+  "min_interval_minutes": 10,
+  "refresh_minutes": 15,
+  "roots": []
+ },
+ "personal": {
+  "enabled": false,
+  "library_path": "",
+  "max_chars": 1600
+ },
+ "personality_reactions": true,
+ "position_awareness": true,
+ "proactive": {
+  "daily_limit": 8,
+  "enabled": true,
+  "min_idle_minutes": 25,
+  "min_interval_minutes": 25,
+  "quiet_hours": [
+   1,
+   8
+  ]
+ },
+ "qq": {
+  "base_url": "http://127.0.0.1:3000",
+  "enabled": false,
+  "group_id": "",
+  "poll_seconds": 4,
+  "private_user": "",
+  "token": "",
+  "whitelist": []
+ },
+ "quick_chat": false,
+ "qwen_tts": {
+  "mix_ref": "docs/seedvc-sample.wav",
+  "mix_weight": 0.0,
+  "voice": "mingyue-v2"
+ },
+ "roam_enabled": false,
+ "self_improve_autonomous": false,
+ "self_improve_enabled": false,
+ "self_improve_estimate_tokens": 0,
+ "self_improve_home_enabled": false,
+ "self_improve_home_interval_min": 60,
+ "self_improve_interval_min": 30,
+ "self_improve_model_enabled": false,
+ "server": {
+  "enabled": true,
+  "port": 8765,
+  "token": ""
+ },
+ "shift_drag_only": false,
+ "sticker_chance": 0.3,
+ "tray_enabled": true,
+ "video_gen": {
+  "duration": 5,
+  "generate_audio": true,
+  "model": "doubao-seedance-1-5-pro-251215",
+  "ratio": "16:9",
+  "resolution": "720p"
+ },
+ "vision": {
+  "base_url": "",
+  "enabled": false,
+  "max_tokens": 400,
+  "model": "",
+  "timeout_s": 60
+ },
+ "visual_memory": true,
+ "visual_memory_interval": 300,
+ "voice": "zh-CN-XiaoyiNeural",
+ "voice_auto_send": false,
+ "voice_backend": "qwen3",
+ "voice_pitch": "+6Hz",
+ "voice_rate": "-4%",
+ "volume": 800,
+ "wake": {
+  "enabled": false,
+  "language": "zh-CN",
+  "phrases": [
+   "大肥鱼",
+   "肥鱼",
+   "小肥鱼"
+  ]
+ },
+ "wechat": {
+  "enabled": false,
+  "port": 8800,
+  "token": ""
+ },
+ "window_opacity": 1.0
+}

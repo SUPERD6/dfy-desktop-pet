@@ -494,7 +494,8 @@ class ConfirmTests(AgentTestCase):
         tool_name, args, preview = self.confirm_calls[0]
         self.assertEqual(tool_name, "write_file")
         self.assertEqual(args["path"], "记录/note.md")
-        self.assertIn("准备写文件", preview)
+        self.assertIn("准备新建文件", preview)
+        self.assertIn("你好", preview)  # 完整内容，不截断（agent-8）
         self.assertIn("note.md", preview)
 
     def test_write_file_confirm_none_rejected_end_to_end(self) -> None:
@@ -990,7 +991,8 @@ class ToolSpecTests(unittest.TestCase):
         self.assertEqual(len(set(names)), len(names), msg="工具名不能重复")
 
     def test_mutating_tools_are_marked(self) -> None:
-        self.assertEqual(set(agent.AgentRunner.MUTATING_TOOLS), {"run_powershell", "write_file"})
+        self.assertEqual(set(agent.AgentRunner.MUTATING_TOOLS),
+                         {"run_powershell", "write_file", "replace_in_file"})
 
 
 if __name__ == "__main__":

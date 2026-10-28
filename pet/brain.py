@@ -283,8 +283,9 @@ def split_mood(reply: str) -> tuple[str, tuple[int, str] | None]:
 
 
 class Brain:
-    def __init__(self, base_dir: Path, config: dict, log=print):
-        self.dir = Path(base_dir)
+    def __init__(self, base_dir: Path, config: dict, log=print, data_dir: Path | None = None):
+        self.dir = Path(base_dir)  # 代码旁的文件：persona.md、.secret_api_key
+        self.data_dir = Path(data_dir) if data_dir else self.dir  # 个人数据：记忆、相处笔记、主人档案、日记
         self.config = config if isinstance(config, dict) else {}
         self.log = log if callable(log) else print
         self.persona = self._read_persona()
@@ -296,7 +297,7 @@ class Brain:
 
         # 记忆：MemoryStore 持有结构化数据；self.memory 继续暴露原始 dict，
         # 兼容旧代码（app.py 设置窗会直接写 brain.memory["user_name"]）。
-        self.memory_store = MemoryStore(self.dir / "memory.json", log=self.log)
+        self.memory_store = MemoryStore(self.data_dir / "memory.json", log=self.log)
         self.memory = self.memory_store.data
         if not self.memory_store.user_name:
             config_name = str(self.config.get("user_name") or "").strip()
@@ -325,12 +326,12 @@ class Brain:
             self.log(f"个人库未接入（不影响聊天）：{exc}")
 
         # 相处笔记：由她自己定期从对话里总结，供后续对话参考
-        self.learned_path = self.dir / "learned_notes.md"
+        self.learned_path = self.data_dir / "learned_notes.md"
         self.learned_notes = ""
         self._load_learned_notes()
 
         # PARTNER.md（Coopanion 风格）：用户可编辑的「她对你的了解」档案，每次改动走 git 留版本
-        self.partner_path = self.dir / "PARTNER.md"
+        self.partner_path = self.data_dir / "PARTNER.md"
         self.partner_text = ""
         self._load_partner()
         try:
@@ -392,8 +393,19 @@ class Brain:
         return added
 
     # ---------- 对外：聊天 ----------
-    def reply(self, text: str) -> tuple[str, str]:
-        """返回 (回复文字, 来源)；来源：llm / offline / offline-error。"""
+    def reply(self, text: str, live_context: str | None = None) -> tuple[str, str]:
+        """返回 (回复文字, 来源)；来源：llm / offline / offline-error。
+
+        live_context：只用于这一次的【此刻】（比如 QQ 来访者只该看到时间和她自己在干嘛），
+        不改共享的 self.live_context，也不影响同时进行的桌面聊天（app-interact-8）。
+        """
+        self._tl.live_context = live_context
+        try:
+            return self._reply(text)
+        finally:
+            self._tl.live_context = None
+
+    def _reply(self, text: str) -> tuple[str, str]:
         self.last_mood = None  # 每轮重新算，别把上一轮（或 QQ 那边）的心情串过来
         text = (text or "").strip()
         if not text:
@@ -517,13 +529,23 @@ class Brain:
         return "；".join(lines)
 
     # ---------- 对外：连接测试 / 主动搭话 / DSH 状态 ----------
-    def test_connection(self) -> tuple[bool, str]:
-        """设置窗「测试连接」用：失败也只返回人话，不打印/返回 Key。"""
-        key, source = self._resolve_api_key()
+    def test_connection(self, llm_override: dict | None = None) -> tuple[bool, str]:
+        """设置窗「测试连接」用：失败也只返回人话，不打印/返回 Key。
+
+        llm_override：设置窗里还没保存的地址/模型/Key，只用于这一次测试，不改 self.config（app-window-2）。
+        """
+        override = llm_override if isinstance(llm_override, dict) else {}
+        key, source = _clean_key(override.get("api_key")), "设置窗里刚填的 Key"
+        if not key:
+            key, source = self._resolve_api_key()
         if not key:
             return (False, "没找到 API Key：在设置里填写，或设环境变量 DFY_API_KEY，"
                            "或写入 pet/.secret_api_key。")
         options = self._llm_options()
+        if override.get("base_url"):
+            options["base_url"] = _normalize_base_url(override["base_url"])
+        if override.get("model"):
+            options["model"] = str(override["model"]).strip()
         options.update({"max_retries": 0,
                         "max_tokens": min(16, options["max_tokens"]),
                         "temperature": 0.0})
@@ -647,7 +669,8 @@ class Brain:
         """
         store = self.memory_store
         blocks: list[tuple[int, str]] = []  # (优先级，越大越重要, 文本)
-        live = str(getattr(self, "live_context", "") or "").strip()
+        override = getattr(self._tl, "live_context", None)
+        live = str(override if override is not None else (getattr(self, "live_context", "") or "")).strip()
         head = f"用户的称呼：{self.user_name()}。"
         if live:
             head += f"\n【此刻】{live}"
@@ -710,7 +733,7 @@ class Brain:
         if episodes:
             parts.append("【之前的日记（接着往下写，别重复）】\n" + "\n".join(
                 f"- {format_time(e.get('end') or e.get('time'))} {e.get('text', '')}" for e in episodes))
-        diary_dir = self.dir / "home" / "diary"
+        diary_dir = self.data_dir / "home" / "diary"
         try:
             latest = max(diary_dir.glob("*.md"), key=lambda p: p.name, default=None)
             if latest is not None:
@@ -860,6 +883,16 @@ class Brain:
         self.memory_store.save()
 
     # ---------- LLM：Key / 参数 ----------
+    def save_api_key(self, key: str) -> None:
+        """Key 只写进 pet/.secret_api_key（已 gitignore，Agent 也读不到），config 里不留明文。"""
+        key = _clean_key(key)
+        if not key:
+            return
+        (self.dir / ".secret_api_key").write_text(key, encoding="utf-8")
+        llm = self.config.get("llm")
+        if isinstance(llm, dict):
+            llm.pop("api_key", None)
+
     def _resolve_api_key(self) -> tuple[str, str]:
         """Key 优先级：config → 环境变量 DFY_API_KEY → pet/.secret_api_key。"""
         llm = self.config.get("llm") or {}

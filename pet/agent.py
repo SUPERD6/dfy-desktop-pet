@@ -37,6 +37,11 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import safety
+except ImportError:  # 作为包导入时
+    from . import safety  # type: ignore
+
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
 
@@ -46,12 +51,13 @@ DEFAULT_SHARED_ROOT = ""  # 个人库默认不开放；需要时写进 allowed_r
 DEFAULT_STATUS_PATH = "~/.dsh/whale-bridge/status.json"
 
 # 步数上限：任务硬要求最多 6 步（配置只能往小改，不能放大）
-MAX_STEPS = 6
-MAX_API_ROUNDS = 12            # 兜底：模型一直给空 tool_calls 时也一定会停
+MAX_STEPS = 80
+MAX_API_ROUNDS = 100           # 兜底：模型一直给空 tool_calls 时也一定会停
 MAX_TOOL_RESULT_CHARS = 8000   # 单条工具结果进模型上下文的最大字符数
 MAX_READ_BYTES_HARD = 5 * 1024 * 1024   # 超过 5MB 的文本文件不直接读
 MAX_WRITE_BYTES = 200 * 1024             # write_file 内容上限 200KB
-MAX_SHELL_COMMAND_CHARS = 4000
+MAX_SHELL_COMMAND_CHARS = 600  # 再长就看不全：让模型拆开或写成脚本文件（agent-8）
+MAX_PREVIEW_LINES = 300        # 预览超过这么多行，确认框只给「拒绝」
 MAX_SHELL_OUTPUT_CHARS = 6000
 MAX_LIST_ENTRIES = 200
 MAX_SEARCH_FILES = 500
@@ -74,12 +80,17 @@ TEXT_EXTENSIONS = {
     ".md", ".txt", ".json", ".py", ".html", ".css", ".js", ".yaml", ".yml", ".log",
 }
 
+# 项目里的个人数据：读到它们之后再上网，要主人确认（agent-6）
+PRIVATE_IN_PROJECT = {"memory.json", "life.json", "appetite.json", "reminders.json", "learned_notes.md",
+                      "PARTNER.md", "overview.json", "memory.vectors.json", "app.log"}
+PRIVATE_DIRS_IN_PROJECT = ("pet/home", "pet/logs")
+
 # 敏感文件名 / 目录：读取、写入、搜索、命令里提到都拒绝
 SENSITIVE_NAMES = {
     ".secret_api_key", "secret_api_key", "credentials", "credentials.json",
     ".credentials", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".netrc", ".pgpass",
 }
-SENSITIVE_PREFIXES = (".env",)          # .env / .env.local / .env.production
+SENSITIVE_PREFIXES = (".env", ".secret")  # .env / .env.local / .secret_*（各种 Key 文件）
 SENSITIVE_SUFFIXES = (".pem", ".key", ".ppk", ".p12", ".pfx", ".jks")
 SENSITIVE_DIRS = {".ssh", ".aws", ".gnupg", "credentials", "secrets"}
 
@@ -142,6 +153,7 @@ TOOL_HINTS: tuple[str, ...] = (
     "search_files：按关键词搜文件内容/文件名。参数 query、root（默认主工作区）、max_results（默认 10）。",
     "run_powershell：执行 PowerShell 命令（会先请主人确认！）。参数 command、timeout_s（默认 60）。",
     "write_file：写文本文件（会先请主人确认！）。参数 path、content。",
+    "replace_in_file：精确替换文本文件里的一小段（old_text 必须唯一出现）；改代码优先用它。参数 path、old_text、new_text。",
     "web_search：搜索公开网页（只读，不访问本机/内网）。参数 query、limit（默认 5）。",
     "web_fetch：读取公开网页正文（只读）。参数 url、max_chars（默认 12000）。",
 )
@@ -251,6 +263,22 @@ TOOL_SPECS: list[dict] = [
                     "content": {"type": "string", "description": "要写入的文本内容"},
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_in_file",
+            "description": "在文本文件里精确替换一小段（old_text 必须唯一出现）。用于改代码/配置的小补丁，比整文件重写安全。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径"},
+                    "old_text": {"type": "string", "description": "要替换的原文本（必须唯一）"},
+                    "new_text": {"type": "string", "description": "替换成的新文本"},
+                },
+                "required": ["path", "old_text", "new_text"],
             },
         },
     },
@@ -401,7 +429,7 @@ class AgentRunner:
     因此不要并发跑多个 `run()`（app 层本来也是一个气泡一次对话）。
     """
 
-    MUTATING_TOOLS = ("run_powershell", "write_file")
+    MUTATING_TOOLS = ("run_powershell", "write_file", "replace_in_file")
 
     def __init__(self, base_dir: Path, config: dict, personal=None, overview=None,
                  status_path=None, log=print, confirm=None):
@@ -416,13 +444,22 @@ class AgentRunner:
         self._active_key = ""
         # 记忆来源（app 里接 Brain）：提供 memory_block(text, include_personal=False)，拼在 system prompt 末尾
         self.memory = None
+        # 这一轮不给模型用的工具（自主进化默认关掉上网）
+        self.disabled_tools: set[str] = set()
+        # 这一轮读过网页（不可信内容）/读过个人资料：之后的外发和改动要真人确认
+        self._tainted = False
+        self._read_private = False
+        self._usage_purpose = "agent"
 
     # ------------------------------------------------------------------ 对外：主循环
     def run(self, user_text: str, on_step=None, purpose: str = "agent",
-            model: str | None = None) -> dict:
+            model: str | None = None, max_steps: int | None = None) -> dict:
         """跑一轮「用户说一句 → 可能调几次工具 → 她回一句」。永不抛异常。"""
         self._usage_purpose = str(purpose or "agent")
+        self._tainted = False
+        self._read_private = False
         self._model_override = str(model or "").strip()
+        self._max_steps_override = int(max_steps or 0)
         steps: list[dict] = []
         try:
             text = str(user_text or "").strip()
@@ -514,6 +551,8 @@ class AgentRunner:
         try:
             tool_args = args if isinstance(args, dict) else {}
             handler = self._tool_handlers().get(name)
+            if name in self.disabled_tools:
+                return {"ok": False, "error": f"这一轮不能用 {name}"}
             if handler is None:
                 return {"ok": False, "error": f"没有这个工具：{name or '(空名字)'}"}
             result = handler(tool_args)
@@ -528,7 +567,8 @@ class AgentRunner:
 
     def tools_spec(self) -> list[dict]:
         """返回 tools 定义的副本（给测试/调试用）。"""
-        return copy.deepcopy(TOOL_SPECS)
+        return [copy.deepcopy(spec) for spec in TOOL_SPECS
+                if spec["function"]["name"] not in self.disabled_tools]
 
     @property
     def tool_names(self) -> tuple[str, ...]:
@@ -544,6 +584,7 @@ class AgentRunner:
             "search_files": self._tool_search_files,
             "run_powershell": self._tool_run_powershell,
             "write_file": self._tool_write_file,
+            "replace_in_file": self._tool_replace_in_file,
             "web_search": self._tool_web_search,
             "web_fetch": self._tool_web_fetch,
         }
@@ -630,6 +671,7 @@ class AgentRunner:
     def _tool_read_personal_library(self, args: dict) -> dict:
         query = str(args.get("query") or "").strip()[:120]
         limit = _clamp_int(args.get("limit"), 5, 1, 20)
+        self._read_private = True
         fn = getattr(self.personal, "find", None) if self.personal is not None else None
         if not callable(fn):
             return {"ok": False, "error": "个人库暂不可用（personal 模块还没接上）"}
@@ -774,6 +816,9 @@ class AgentRunner:
             return {"ok": False, "error": "这个文件不是 UTF-8/GBK 文本，按二进制处理不读"}
         if truncated:
             text += (f"\n\n[已截断：原文件 {size} 字节，这里只读了前 {len(raw)} 字节]")
+        if not self._in_project(path) or self._is_private_data(path):
+            self._read_private = True
+        text = safety.redact_secret_fields(text)  # config.json 里的 token/key 字段不给模型看
         return {"ok": True, "path": self._display_path(path), "size": size,
                 "bytes_read": len(raw), "truncated": truncated, "content": text}
 
@@ -840,10 +885,11 @@ class AgentRunner:
                     continue
                 for lineno, line in enumerate(text.splitlines(), 1):
                     if needle in line.casefold():
+                        self._mark_private(file_path)  # 搜到个人数据也算读过隐私（agent-6）
                         matches.append({
                             "path": self._display_path(file_path),
                             "line": lineno,
-                            "text": line.strip()[:200],
+                            "text": safety.redact_secret_fields(line.strip())[:200],
                         })
                         break  # 一个文件先给一条，结果更有代表性
                 if len(matches) >= max_results:
@@ -863,6 +909,11 @@ class AgentRunner:
             limit = _clamp_int(args.get("limit"), 5, 1, 10)
         except Exception:
             limit = 5
+        if self._read_private:  # 读过个人资料后，搜索词可能夹带内容外发：要主人点头
+            allowed, reason = self._ask_confirm("web_search", args, "准备上网搜索：" + query[:200], force=True)
+            if not allowed:
+                return {"ok": False, "rejected": True, "error": reason}
+        self._tainted = True
         try:
             try:
                 from web_tools import search_web
@@ -882,6 +933,12 @@ class AgentRunner:
             max_chars = _clamp_int(args.get("max_chars"), 12000, 500, 20000)
         except Exception:
             max_chars = 12000
+        from urllib.parse import urlsplit
+        if self._read_private or len(urlsplit(url).query) > 200:
+            allowed, reason = self._ask_confirm("web_fetch", args, "准备打开网页：" + url[:300], force=True)
+            if not allowed:
+                return {"ok": False, "rejected": True, "error": reason}
+        self._tainted = True
         try:
             try:
                 from web_tools import fetch_url
@@ -910,11 +967,21 @@ class AgentRunner:
                     "error": f"内容太大（{len(data)} 字节，上限 {MAX_WRITE_BYTES} 字节）"}
         if path.exists() and path.is_dir():
             return {"ok": False, "error": f"目标是目录不是文件：{self._display_path(path)}"}
-        preview = ("准备写文件\n路径：{}\n大小：{} 字节\n内容预览：\n{}".format(
-            self._display_path(path), len(data), content[:CONFIRM_PREVIEW_CHARS])
-            + ("\n…" if len(content) > CONFIRM_PREVIEW_CHARS else ""))
-        if self._is_own_home(path) or self._is_own_file(path):
-            allowed, reason = True, ""  # 只放行她自己的小屋/人设/笔记；项目代码不自动放行
+        if path.exists():
+            try:
+                before = path.read_text(encoding="utf-8")
+            except Exception:
+                before = ""
+            preview = "准备改写文件\n路径：{}\n大小：{} 字节\n改动（完整 diff）：\n{}".format(
+                self._display_path(path), len(data), _unified_diff(before, content, path.name))
+        else:
+            preview = "准备新建文件\n路径：{}\n大小：{} 字节\n完整内容：\n{}".format(
+                self._display_path(path), len(data), content)
+        blocked = self._self_improve_block(path)
+        if blocked:
+            return {"ok": False, "rejected": True, "error": blocked}
+        if self._auto_own(path):
+            allowed, reason = True, ""  # 只放行她自己的小屋/相处笔记，且这一轮没读过网页；项目代码不自动放行
             try:
                 backup = path.with_name(path.name + ".bak-self")
                 if path.exists() and not backup.exists():
@@ -922,7 +989,7 @@ class AgentRunner:
             except OSError:
                 pass
         else:
-            allowed, reason = self._ask_confirm("write_file", args, preview)
+            allowed, reason = self._ask_confirm("write_file", args, preview, force=self._tainted)
         if not allowed:
             return {"ok": False, "rejected": True, "error": reason}
         created = not path.exists()
@@ -945,13 +1012,75 @@ class AgentRunner:
         return {"ok": True, "path": self._display_path(path), "bytes": len(data),
                 "created": created}
 
+    def _tool_replace_in_file(self, args: dict) -> dict:
+        """精确替换一小段文本；用于自主改代码，避免整文件重写。"""
+        path, error = self._resolve_tool_path(args.get("path"))
+        if error:
+            return {"ok": False, "error": error}
+        old = args.get("old_text")
+        new = args.get("new_text")
+        if not isinstance(old, str) or not old:
+            return {"ok": False, "error": "old_text 必须是非空字符串"}
+        if not isinstance(new, str):
+            return {"ok": False, "error": "new_text 必须是字符串"}
+        suffix = path.suffix.lower()
+        if suffix not in TEXT_EXTENSIONS:
+            return {"ok": False, "error": f"只允许改文本文件，不写 {suffix or '无扩展名'} 文件"}
+        if not path.is_file():
+            return {"ok": False, "error": f"文件不存在：{self._display_path(path)}"}
+        try:
+            data = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            return {"ok": False, "error": f"读取失败：{exc}"}
+        count = data.count(old)
+        if count != 1:
+            return {"ok": False, "error": f"old_text 在文件里出现 {count} 次，必须正好 1 次"}
+        updated = data.replace(old, new, 1)
+        raw = updated.encode("utf-8")
+        if len(raw) > MAX_WRITE_BYTES:
+            return {"ok": False, "error": f"改后太大（{len(raw)} 字节，上限 {MAX_WRITE_BYTES}）"}
+        preview = "准备精确替换\n路径：{}\n改动（完整 diff）：\n{}".format(
+            self._display_path(path), _unified_diff(data, updated, path.name))
+        blocked = self._self_improve_block(path)
+        if blocked:
+            return {"ok": False, "rejected": True, "error": blocked}
+        if self._auto_own(path):
+            allowed, reason = True, ""
+            try:
+                backup = path.with_name(path.name + ".bak-self")
+                if path.exists() and not backup.exists():
+                    backup.write_bytes(path.read_bytes())
+            except OSError:
+                pass
+        else:
+            allowed, reason = self._ask_confirm("replace_in_file", args, preview, force=self._tainted)
+        if not allowed:
+            return {"ok": False, "rejected": True, "error": reason}
+        try:
+            fd, tmp_name = tempfile.mkstemp(prefix=".dfy-edit-", suffix=".tmp", dir=str(path.parent))
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(raw)
+                os.replace(tmp_name, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        except OSError as exc:
+            return {"ok": False, "error": f"写入失败：{exc}"}
+        return {"ok": True, "path": self._display_path(path), "bytes": len(raw),
+                "replaced_chars": len(old), "new_chars": len(new)}
+
     def _tool_run_powershell(self, args: dict) -> dict:
         command = str(args.get("command") or "").strip()
         timeout_s = _clamp_int(args.get("timeout_s"), DEFAULT_SHELL_TIMEOUT_S, 1, 300)
         if not command:
             return {"ok": False, "error": "命令不能为空"}
         if len(command) > MAX_SHELL_COMMAND_CHARS:
-            return {"ok": False, "error": f"命令太长（超过 {MAX_SHELL_COMMAND_CHARS} 字符）"}
+            return {"ok": False, "error": f"命令太长（超过 {MAX_SHELL_COMMAND_CHARS} 字，主人在确认框里看不全）："
+                                          "拆成几条短命令，或先用 write_file 写成 .ps1 脚本再运行"}
         danger = self._dangerous_reason(command)
         if danger:
             return {"ok": False, "error": f"命令看起来有破坏性（{danger}），已拒绝执行"}
@@ -962,11 +1091,15 @@ class AgentRunner:
         if not exe:
             return {"ok": False, "error": "这台机器上没找到 PowerShell"}
         cwd = self._shell_cwd()
-        preview = ("准备执行 PowerShell（工作目录：{}）\n命令：\n{}".format(
-            self._display_path(cwd), command[:CONFIRM_PREVIEW_CHARS]))
-        allowed, reason = self._ask_confirm("run_powershell", args, preview)
+        preview = "准备执行 PowerShell（工作目录：{}）\n命令（完整）：\n{}".format(self._display_path(cwd), command)
+        network = safety.network_command_reason(command)
+        if network:
+            preview = f"⚠ 这条命令会联网/对外发送或安装东西（{network}）\n" + preview
+        allowed, reason = self._ask_confirm("run_powershell", args, preview,
+                                            force=bool(network) or self._tainted)
         if not allowed:
             return {"ok": False, "rejected": True, "error": reason}
+        self._read_private = True  # 不知道命令输出里有什么：之后再上网要确认（agent-6）
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         try:
             proc = subprocess.Popen(
@@ -1038,15 +1171,44 @@ class AgentRunner:
 
     @staticmethod
     def _sensitive_command_reason(command: str) -> str:
-        match = SENSITIVE_COMMAND_RE.search(command)
+        match = SENSITIVE_COMMAND_RE.search(command) or safety.SECRET_COMMAND_RE.search(command)
         return match.group(1) if match else ""
 
-    def _ask_confirm(self, tool_name: str, args: dict, preview: str):
-        """调用 confirm(tool_name, args, preview)；没有回调、回调报错都按「拒绝」处理。"""
+    def _in_project(self, path: Path) -> bool:
+        root = self.base_dir.resolve()
+        if root.name.lower() == "pet":
+            root = root.parent
+        return _is_within(Path(path).resolve(), root)
+
+    def _self_improve_block(self, path: Path) -> str:
+        """自主进化时硬拦：护栏/配置/规则文件和项目外一律不准写，不管确认回调怎么说。"""
+        if self._usage_purpose != "self_improve":
+            return ""
+        if self._is_own_home(path):
+            return ""
+        root = self.base_dir.resolve()
+        if root.name.lower() == "pet":
+            root = root.parent
+        if safety.is_protected(path, root):
+            return "自主进化不能改这个文件（权限/配置/规则/项目外），已拒绝"
+        return ""
+
+    def _ask_confirm(self, tool_name: str, args: dict, preview: str, force: bool = False):
+        """调用 confirm(tool_name, args, preview)；没有回调、回调报错都按「拒绝」处理。
+
+        force=True：联网命令、读过网页后的改动、读过个人资料后的上网——必须真人点头，
+        全权限托管也不自动放行（回调不认 force 参数的一律当拒绝）。
+        """
         if not callable(self.confirm):
             return False, "没有可用的确认弹窗，这个操作需要主人点头，已拒绝"
         try:
-            answer = self.confirm(tool_name, dict(args), preview)
+            if force:
+                try:
+                    answer = self.confirm(tool_name, dict(args), preview, force=True)
+                except TypeError:
+                    return False, "这个操作必须主人亲自确认，已拒绝"
+            else:
+                answer = self.confirm(tool_name, dict(args), preview)
         except Exception as exc:
             self.log("确认回调出错：" + self._redact(str(exc))[:160])
             return False, "确认弹窗出错了，已拒绝这个操作"
@@ -1136,13 +1298,39 @@ class AgentRunner:
             return False
 
     def _is_own_file(self, path: Path) -> bool:
-        """她自己的文本：persona / 相处笔记 / PARTNER；不包含代码和 config。"""
+        """她自己的文本：只有相处笔记。persona.md（她的人设）和 PARTNER.md（主人的档案）任何时候都要确认（agent-5）。"""
         try:
             if path.resolve().parent != self.base_dir.resolve():
                 return False
-            return path.name in ("persona.md", "learned_notes.md", "PARTNER.md")
+            return path.name == "learned_notes.md"
         except OSError:
             return False
+
+    def _auto_own(self, path: Path) -> bool:
+        """不问主人直接写：她的小屋 / 相处笔记，而且这一轮没读过网页（读过就可能被网页带偏，要确认）。"""
+        if self._tainted:
+            return False
+        if self._is_own_home(path):
+            return True
+        return self._is_own_file(path) and self._usage_purpose != "self_improve"
+
+    def _is_private_data(self, path: Path) -> bool:
+        try:
+            resolved = Path(path).resolve()
+        except OSError:
+            return False
+        if resolved.name in PRIVATE_IN_PROJECT:
+            return True
+        root = self.base_dir.resolve()
+        if root.name.lower() == "pet":
+            root = root.parent
+        return any(_is_within(resolved, (root / sub).resolve()) for sub in PRIVATE_DIRS_IN_PROJECT)
+
+    def _mark_private(self, path: Path) -> bool:
+        """search_files 命中个人数据时记一笔；永远返回 False（方便写在表达式里）。"""
+        if self._is_private_data(path):
+            self._read_private = True
+        return False
 
     def _display_path(self, path: Path) -> str:
         """给模型/界面看的短路径：在主工作区里就显示相对路径，否则显示绝对路径。"""
@@ -1161,13 +1349,16 @@ class AgentRunner:
         agent_cfg = _as_dict(self.config.get("agent"))
         override = str(getattr(self, "_model_override", "") or "").strip()
         model = override or str(llm.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+        step_cap = _clamp_int(agent_cfg.get("max_steps"), MAX_STEPS, 1, MAX_STEPS)
+        if int(getattr(self, "_max_steps_override", 0) or 0) > 0:
+            step_cap = min(step_cap, int(self._max_steps_override))
         return {
             "base_url": _normalize_base_url(llm.get("base_url")),
             "model": model,
             "timeout_s": _clamp_float(llm.get("timeout_s"), 30.0, 0.1, 300.0),
             "max_tokens": _clamp_int(agent_cfg.get("max_tokens"), 800, 64, 4096),
             "temperature": _clamp_float(agent_cfg.get("temperature"), 0.3, 0.0, 2.0),
-            "max_steps": _clamp_int(agent_cfg.get("max_steps"), MAX_STEPS, 1, MAX_STEPS),
+            "max_steps": step_cap,
         }
 
     def _resolve_api_key(self) -> tuple[str, str]:
@@ -1238,7 +1429,7 @@ class AgentRunner:
             data = json.loads(raw.decode("utf-8"))
         except Exception:
             raise AgentError("模型接口返回了无法解析的内容") from None
-        appetite = getattr(self.memory, "appetite", None)  # 记饭量：Agent 的每一轮工具调用也是她在吃 token
+        appetite = getattr(self.memory, "appetite", None) or getattr(self, "appetite", None)
         if appetite is not None and isinstance(data, dict):
             appetite.eat(data.get("usage"), getattr(self, "_usage_purpose", "agent"))
         choices = data.get("choices") if isinstance(data, dict) else None
@@ -1422,3 +1613,12 @@ class AgentRunner:
         if isinstance(obj, dict):
             return {str(key): self._redact_obj(value) for key, value in obj.items()}
         return obj
+
+
+def _unified_diff(before: str, after: str, name: str) -> str:
+    """给确认框看的完整改动（不截断）。"""
+    import difflib
+
+    lines = difflib.unified_diff(str(before).splitlines(), str(after).splitlines(),
+                                 fromfile=f"{name}（改前）", tofile=f"{name}（改后）", lineterm="", n=2)
+    return "\n".join(lines) or "（内容没有变化）"

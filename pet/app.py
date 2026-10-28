@@ -64,6 +64,9 @@ try:
 except Exception:
     pick_music_source = None
 from memory import format_time
+import safety
+from config_defaults import apply_defaults, default_config
+from config_defaults import save_config as save_config_file
 from sfx import Sfx
 from stickers import StickerBook
 from singing import Songbook
@@ -80,7 +83,8 @@ MOOD_STATES = {"开心": "happy", "害羞": "shy", "得意": "proud", "想念": 
 BASE = Path(__file__).resolve().parent
 ASSETS = BASE / "assets"
 CACHE = BASE / "cache"
-LOG_DIR = BASE / "logs"
+# 设了 DFY_DATA_DIR（冒烟/测试）时日志也写过去，不碰真实的 pet/logs/app.log（repo-3）
+LOG_DIR = (Path(os.environ["DFY_DATA_DIR"]) / "logs") if os.environ.get("DFY_DATA_DIR") else BASE / "logs"
 CONFIG_PATH = BASE / "config.json"
 # 她的个人生活数据（饭量账本、生活状态、小窝）放哪；冒烟测试指到临时目录，别写坏真数据
 DATA_DIR = Path(os.environ.get("DFY_DATA_DIR") or BASE)
@@ -176,13 +180,49 @@ PARTNER_TEMPLATE = """# PARTNER.md · 她对主人的了解
 
 
 # --------------------------------------------------------------------------- 基础工具
+LOG_MAX_BYTES = 2 * 1024 * 1024  # 超过就轮转：app.log → app.log.1 → app.log.2，最多留 3 份
+LOG_KEEP = 2
+_log_lock = threading.Lock()
+
+
+def _rotate_log(path: Path) -> None:
+    try:
+        if not path.exists() or path.stat().st_size < LOG_MAX_BYTES:
+            return
+        for index in range(LOG_KEEP, 0, -1):
+            older = path.with_name(f"{path.name}.{index}")
+            newer = path.with_name(f"{path.name}.{index - 1}") if index > 1 else path
+            if newer.exists():
+                os.replace(newer, older)
+    except OSError:
+        pass
+
+
 def log(message: str) -> None:
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(LOG_DIR / "app.log", "a", encoding="utf-8") as handle:
-            handle.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + str(message) + "\n")
+        path = LOG_DIR / "app.log"
+        with _log_lock:
+            _rotate_log(path)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + str(message) + "\n")
     except Exception:
         pass
+
+
+def log_exception(where: str, exc_type, exc, tb) -> None:
+    """没人接的异常也写进日志：用桌面图标（pythonw）启动时没有控制台，不记就什么都看不到。"""
+    import traceback
+
+    detail = "".join(traceback.format_exception(exc_type, exc, tb))[-2000:]
+    log(f"未处理的异常（{where}）：{exc_type.__name__ if exc_type else '?'}：{exc}\n{detail}")
+
+
+def install_exception_logging(root) -> None:
+    root.report_callback_exception = lambda exc_type, exc, tb: log_exception("界面回调", exc_type, exc, tb)
+    sys.excepthook = lambda exc_type, exc, tb: log_exception("主线程", exc_type, exc, tb)
+    threading.excepthook = lambda args: log_exception(
+        f"线程 {getattr(args.thread, 'name', '?')}", args.exc_type, args.exc_value, args.exc_traceback)
 
 
 def load_json(path: Path, default):
@@ -1336,11 +1376,15 @@ class QuickChat(tk.Toplevel):
 class ApprovalPrompt(tk.Toplevel):
     """桌宠旁边的确认气泡：她要用工具时，不弹系统框，直接在鱼旁边问「允许吗」。"""
 
-    def __init__(self, app: "PetApp", tool_name: str, preview: str, callback):
+    MAX_LINES = 300      # 预览超过这么多行就看不完：只给「拒绝」
+    ARM_DELAY_MS = 600   # 弹出后这么久之内「允许」按不动，免得正在打字/连点时误放行
+
+    def __init__(self, app: "PetApp", tool_name: str, preview: str, callback, force: bool = False):
         super().__init__(app.root)
         self.app = app
         self._callback = callback
         self._done = False
+        self._afters: list = []  # 关掉时要取消，不然定时回调落在已销毁的窗口上
         self.overrideredirect(True)
         try:
             self.attributes("-topmost", True)
@@ -1359,28 +1403,56 @@ class ApprovalPrompt(tk.Toplevel):
                  font=("Microsoft YaHei", 10, "bold")).pack(side="left")
         tk.Label(header, text=f"· {tool_name}", bg="#fff6e6", fg="#b07a2a",
                  font=("Microsoft YaHei", 8)).pack(side="left", padx=(3, 0))
-        body = tk.Label(outer, text=str(preview)[:700], bg="#ffffff", fg="#2a3550",
-                        justify="left", anchor="w", wraplength=356,
-                        font=("Microsoft YaHei", 9))
-        body.pack(fill="x", padx=12, pady=(8, 6))
+        text = str(preview)
+        lines = text.count("\n") + 1
+        too_long = lines > self.MAX_LINES
+        # 完整预览（命令全文 / 完整 diff），可滚动、只读，不再截断（agent-8）
+        frame = tk.Frame(outer, bg="#ffffff")
+        frame.pack(fill="both", expand=True, padx=12, pady=(8, 6))
+        body = tk.Text(frame, height=min(14, max(3, lines)), width=48, wrap="char", bg="#ffffff", fg="#2a3550",
+                       relief="flat", font=("Microsoft YaHei", 9))
+        scroll = tk.Scrollbar(frame, command=body.yview)
+        body.configure(yscrollcommand=scroll.set)
+        body.insert("1.0", text)
+        body.configure(state="disabled")
+        body.pack(side="left", fill="both", expand=True)
+        if lines > 14:
+            scroll.pack(side="right", fill="y")
+        if too_long:
+            tk.Label(outer, text=f"改动有 {lines} 行，太长看不完，只能拒绝；让她拆小一点再来。", bg="#ffffff",
+                     fg="#c0392b", font=("Microsoft YaHei", 8)).pack(fill="x", padx=12)
+        elif force:
+            tk.Label(outer, text="⚠ 这一步会联网/安装，或者她刚读过网页：请看清内容再允许", bg="#ffffff",
+                     fg="#c0392b", font=("Microsoft YaHei", 8)).pack(fill="x", padx=12)
         buttons = tk.Frame(outer, bg="#ffffff")
         buttons.pack(fill="x", padx=12, pady=(0, 10))
         tk.Button(buttons, text="拒绝", command=lambda: self._finish(False),
                   bg="#eef1f6", fg="#5a6b8f", activebackground="#dde3ee",
                   relief="flat", cursor="hand2", padx=16,
                   font=("Microsoft YaHei", 9)).pack(side="right", padx=(8, 0))
-        tk.Button(buttons, text="允许这次", command=lambda: self._finish(True),
-                  bg="#4a7cf0", fg="#ffffff", activebackground="#3b6be0",
-                  relief="flat", cursor="hand2", padx=14,
-                  font=("Microsoft YaHei", 9, "bold")).pack(side="right")
-        self.bind("<Return>", lambda event: self._finish(True))
+        self.allow_button = None
+        if not too_long:
+            self.allow_button = tk.Button(
+                buttons, text="允许这次（高风险）" if force else "允许这次", command=lambda: self._finish(True),
+                bg="#c0392b" if force else "#4a7cf0", fg="#ffffff",
+                activebackground="#a93226" if force else "#3b6be0", relief="flat", cursor="hand2", padx=14,
+                font=("Microsoft YaHei", 9, "bold"), state="disabled")
+            self.allow_button.pack(side="right")
+            self._afters.append(self.after(self.ARM_DELAY_MS, self._arm))
+        # 不绑回车、不抢焦点：主人在别处打字时按回车不会误放行（app-interact-1）；Esc 只用来拒绝
         self.bind("<Escape>", lambda event: self._finish(False))
         self.update_idletasks()
         height = max(150, self.winfo_reqheight())
         self.follow_pet(height)
-        self.after(120, lambda: self.follow_pet(self.winfo_height() or height))
-        self.after(180000, lambda: self._finish(False))
-        self.focus_force()
+        self._afters.append(self.after(120, lambda: self.follow_pet(self.winfo_height() or height)))
+        self._afters.append(self.after(180000, lambda: self._finish(False)))
+
+    def _arm(self) -> None:
+        try:
+            if self.allow_button is not None and not self._done:
+                self.allow_button.configure(state="normal")
+        except Exception:
+            pass
 
     def follow_pet(self, height: int) -> None:
         try:
@@ -1427,6 +1499,11 @@ class ApprovalPrompt(tk.Toplevel):
                 self._callback(False)
             except Exception:
                 pass
+        for job in getattr(self, "_afters", []):
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
         super().destroy()
 
 
@@ -1455,7 +1532,8 @@ class SettingsWindow(tk.Toplevel):
 
         self.base_url = self._row(form, 1, "接口地址", llm.get("base_url") or "https://api.deepseek.com/v1")
         self.model = self._row(form, 2, "模型名", llm.get("model") or "deepseek-chat")
-        self.api_key = self._row(form, 3, "API Key", llm.get("api_key") or "", show="*")
+        # Key 不回显、不进 config.json：留空表示不改（保存时写进 pet/.secret_api_key）
+        self.api_key = self._row(form, 3, "API Key（留空不改）", "", show="*")
         self.voice = self._row(form, 4, "音色", config.get("voice") or "zh-CN-XiaoyiNeural")
         self.user_name = self._row(form, 5, "你的称呼", config.get("user_name") or app.brain.user_name())
 
@@ -1541,29 +1619,32 @@ class SettingsWindow(tk.Toplevel):
         return entry
 
     def test_connection(self) -> None:
-        """用输入框里当前的 Key/地址/模型测一次；不写盘，测完恢复现场。"""
-        llm = self.app.config.setdefault("llm", {})
-        backup = dict(llm)
-        llm["enabled"] = True
-        llm["api_key"] = self.api_key.get().strip() or llm.get("api_key", "")
-        llm["base_url"] = self.base_url.get().strip() or llm.get("base_url")
-        llm["model"] = self.model.get().strip() or llm.get("model")
+        """用输入框里当前的 Key/地址/模型测一次：只传给这次测试，不改共享配置（中途关窗也不会留下脏配置）。"""
+        override = {"api_key": self.api_key.get().strip(), "base_url": self.base_url.get().strip(),
+                    "model": self.model.get().strip()}
         self.api_test_btn.configure(state="disabled")
         self.api_test_label.configure(text="正在测试连接…", fg="#7a88aa")
 
         def worker() -> None:
             try:
-                ok, detail = self.app.brain.test_connection()
+                ok, detail = self.app.brain.test_connection(override)
             except Exception as exc:  # 不让 UI 线程收到异常
                 ok, detail = False, "测试失败：" + str(exc)[:120]
-            self.after(0, self._on_test_done, ok, detail, backup)
+            try:
+                self.app.root.after(0, self._on_test_done, ok, detail)
+            except Exception:
+                pass
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_test_done(self, ok: bool, detail: str, backup: dict) -> None:
-        self.app.config["llm"] = backup
-        self.api_test_btn.configure(state="normal")
-        self.api_test_label.configure(text=detail, fg="#2e7d32" if ok else "#c62828")
+    def _on_test_done(self, ok: bool, detail: str) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+            self.api_test_btn.configure(state="normal")
+            self.api_test_label.configure(text=detail, fg="#2e7d32" if ok else "#c62828")
+        except tk.TclError:
+            pass  # 测试中途窗口关了
 
     def save(self) -> None:
         config = self.app.config
@@ -1571,7 +1652,14 @@ class SettingsWindow(tk.Toplevel):
         llm["enabled"] = bool(self.enabled.get())
         llm["base_url"] = self.base_url.get().strip() or "https://api.deepseek.com/v1"
         llm["model"] = self.model.get().strip() or "deepseek-chat"
-        llm["api_key"] = self.api_key.get().strip()
+        new_key = self.api_key.get().strip()
+        if new_key:
+            try:
+                self.app.brain.save_api_key(new_key)
+            except Exception as exc:
+                messagebox_error = f"Key 保存失败：{exc}"
+                self.app.bubble.show(messagebox_error, 4000)
+        llm.pop("api_key", None)  # Key 只放 pet/.secret_api_key，不进被 Git 跟踪的 config.json
         config["voice"] = self.voice.get().strip() or "zh-CN-XiaoyiNeural"
         config["user_name"] = self.user_name.get().strip()
         config["mute"] = bool(self.mute.get())
@@ -1946,157 +2034,8 @@ class PetApp:
         # 从哪读就写回哪：DFY_CONFIG 指向临时配置时（冒烟测试），绝不能写坏真正的 config.json
         self.config_path = Path(os.environ.get("DFY_CONFIG") or CONFIG_PATH).expanduser()
         self.config = load_json(self.config_path, {})
-        self.config.setdefault("llm", {})
-        self.config.setdefault("voice", "zh-CN-XiaoyiNeural")
-        self.config.setdefault("voice_rate", "-4%")
-        self.config.setdefault("voice_pitch", "+6Hz")
-        self.config.setdefault("greet_on_start", True)
-        self.config.setdefault("always_on_top", True)
-        self.config.setdefault("mute", False)
-        self.config.setdefault("volume", 800)
-        proactive = self.config.setdefault("proactive", {})
-        if not isinstance(proactive, dict):
-            proactive = {}
-            self.config["proactive"] = proactive
-        proactive.setdefault("enabled", True)
-        proactive.setdefault("min_idle_minutes", 25)
-        proactive.setdefault("min_interval_minutes", 25)
-        proactive.setdefault("daily_limit", 8)
-        feed_counts = self.config.setdefault("feed_counts", {})
-        if not isinstance(feed_counts, dict):
-            feed_counts = {}
-            self.config["feed_counts"] = feed_counts
-        for food in FEED_LINES:
-            feed_counts.setdefault(food, 0)
-        self.config.setdefault("inner_voice_chance", 1 / 6)
-        self.config.setdefault("sticker_chance", 0.3)  # 聊天回复后顺手甩个表情包的概率
-        dsh_status = self.config.setdefault("dsh_status", {})
-        if not isinstance(dsh_status, dict):
-            dsh_status = {}
-            self.config["dsh_status"] = dsh_status
-        dsh_status.setdefault("enabled", True)
-        dsh_status.setdefault("path", "~/.dsh/whale-bridge/status.json")
-        dsh_status.setdefault("poll_ms", 1000)
-        personal = self.config.setdefault("personal", {})
-        if not isinstance(personal, dict):
-            personal = {}
-            self.config["personal"] = personal
-        personal.setdefault("enabled", False)
-        personal.setdefault("library_path", "")
-        personal.setdefault("max_chars", 1600)
-        overview = self.config.setdefault("overview", {})
-        if not isinstance(overview, dict):
-            overview = {}
-            self.config["overview"] = overview
-        overview.setdefault("enabled", True)
-        overview.setdefault("min_interval_minutes", 10)
-        overview.setdefault("refresh_minutes", 15)
-        overview.setdefault("roots", [])
-        agent = self.config.setdefault("agent", {})
-        if not isinstance(agent, dict):
-            agent = {}
-            self.config["agent"] = agent
-        agent.setdefault("enabled", True)
-        agent.setdefault("max_steps", 6)
-        agent.setdefault("allowed_roots", [str(BASE.parent)])
-        self.config.setdefault("quick_chat", False)
-        self.config.setdefault("chat_open_on_start", False)
-        self.config.setdefault("autonomy_enabled", True)
-        self.config.setdefault("self_improve_enabled", True)
-        self.config.setdefault("self_improve_autonomous", True)
-        self.config.setdefault("self_improve_interval_min", 30)
-        self.config.setdefault("self_improve_estimate_tokens", 0)
-        self.config.setdefault("autonomy_daily_limit", 0)
-        self.config.setdefault("autonomy_model", "deepseek-v4-pro")
-        self.config.setdefault("ambient_screen_enabled", True)
-        self.config.setdefault("ambient_screen_interval", 300)
-        self.config.setdefault("roam_enabled", False)
-        self.config.setdefault("click_sound", True)
-        self.config.setdefault("click_sound_style", "duck")
-        self.config.setdefault("personality_reactions", True)
-        self.config.setdefault("tray_enabled", True)
-        self.config.setdefault("autostart", False)
-        self.config.setdefault("click_through", False)
-        self.config.setdefault("lock_position", False)
-        self.config.setdefault("shift_drag_only", False)
-        self.config.setdefault("window_opacity", 1.0)
-        self.config.setdefault("hotkeys_enabled", True)
-        self.config.setdefault("free_placement", True)
-        vision_cfg = self.config.setdefault("vision", {})
-        if not isinstance(vision_cfg, dict):
-            vision_cfg = {}
-            self.config["vision"] = vision_cfg
-        vision_cfg.setdefault("enabled", False)
-        vision_cfg.setdefault("base_url", "")
-        vision_cfg.setdefault("model", "")
-        vision_cfg.setdefault("timeout_s", 60)
-        vision_cfg.setdefault("max_tokens", 400)
-        video_cfg = self.config.setdefault("video_gen", {})
-        if not isinstance(video_cfg, dict):
-            video_cfg = {}
-            self.config["video_gen"] = video_cfg
-        video_cfg.setdefault("model", "doubao-seedance-1-5-pro-251215")
-        video_cfg.setdefault("ratio", "16:9")
-        video_cfg.setdefault("duration", 5)
-        video_cfg.setdefault("resolution", "720p")
-        video_cfg.setdefault("generate_audio", True)
-        self.config.setdefault("voice_backend", "gptsovits")
-        gs_cfg = self.config.setdefault("gptsovits", {})
-        if not isinstance(gs_cfg, dict):
-            gs_cfg = {}
-            self.config["gptsovits"] = gs_cfg
-        gs_cfg.setdefault("base_url", "http://127.0.0.1:9880")
-        gs_cfg.setdefault("ref_audio_path", "cache/gptsovits/ref.wav")
-        gs_cfg.setdefault("prompt_text", "本鲸叫小鲸鱼，最喜欢白饭和主人的摸头。")
-        gs_cfg.setdefault("prompt_lang", "zh")
-        gs_cfg.setdefault("text_lang", "zh")
-        gs_cfg.setdefault("text_split_method", "cut5")
-        self.config.setdefault("voice_auto_send", False)
-        self.config.setdefault("asr_backend", "whisper")
-        self.config.setdefault("barge_in_enabled", True)
-        self.config.setdefault("click_jump", True)
-        self.config.setdefault("double_click_chat", False)
-        self.config.setdefault("visual_memory", True)
-        self.config.setdefault("visual_memory_interval", 300)
-        agent_cfg = self.config.setdefault("agent", {})
-        if isinstance(agent_cfg, dict):
-            agent_cfg.setdefault("auto_approve", False)
-            agent_cfg.setdefault("auto_approve_own_home", True)  # 只自动放行 pet/home
-        wake_cfg = self.config.setdefault("wake", {})
-        if not isinstance(wake_cfg, dict):
-            wake_cfg = {}
-            self.config["wake"] = wake_cfg
-        wake_cfg.setdefault("enabled", False)
-        wake_cfg.setdefault("phrases", ["大肥鱼", "肥鱼", "小肥鱼"])
-        wake_cfg.setdefault("language", "zh-CN")
-        server_cfg = self.config.setdefault("server", {})
-        if not isinstance(server_cfg, dict):
-            server_cfg = {}
-            self.config["server"] = server_cfg
-        server_cfg.setdefault("enabled", True)
-        server_cfg.setdefault("port", 8765)
-        server_cfg.setdefault("token", "")
-        qq_cfg = self.config.setdefault("qq", {})
-        if not isinstance(qq_cfg, dict):
-            qq_cfg = {}
-            self.config["qq"] = qq_cfg
-        qq_cfg.setdefault("enabled", False)
-        qq_cfg.setdefault("base_url", "http://127.0.0.1:3000")
-        qq_cfg.setdefault("token", "")
-        qq_cfg.setdefault("private_user", "")
-        qq_cfg.setdefault("group_id", "")
-        qq_cfg.setdefault("whitelist", [])
-        qq_cfg.setdefault("poll_seconds", 4)
-        wechat_cfg = self.config.setdefault("wechat", {})
-        if not isinstance(wechat_cfg, dict):
-            wechat_cfg = {}
-            self.config["wechat"] = wechat_cfg
-        wechat_cfg.setdefault("enabled", False)
-        wechat_cfg.setdefault("port", 8800)
-        wechat_cfg.setdefault("token", "")
-        proactive = self.config.get("proactive")
-        if isinstance(proactive, dict):
-            proactive.setdefault("quiet_hours", [1, 8])
+        self.config = apply_defaults(self.config, BASE.parent, FEED_LINES)
+        self._config_defaults = default_config(BASE.parent, FEED_LINES)
         if not self.config.get("character"):
             default_char = "codex-whale" if (ASSETS / "characters" / "codex-whale" / "manifest.json").exists() else "dfy"
             self.config["character"] = default_char
@@ -2107,6 +2046,7 @@ class PetApp:
         from voice import VoiceEngine
 
         self.root = tk.Tk()
+        install_exception_logging(self.root)
         self.root.title(f"{self.display_name} · 大肥鱼桌宠")
         self.root.overrideredirect(True)
         self.root.configure(bg=KEY_COLOR)
@@ -2152,7 +2092,30 @@ class PetApp:
 
         if self.splash:
             self.splash.stage("唤醒大脑……")
-        self.brain = Brain(BASE, self.config, log=log)
+        self.brain = Brain(BASE, self.config, log=log, data_dir=DATA_DIR)
+        legacy_key = str(((self.config.get("llm") or {}).get("api_key")) or "").strip()
+        if legacy_key:  # 旧版设置窗把 Key 写进了 config.json：挪进 .secret_api_key（app-window-2）
+            try:
+                if not (BASE / ".secret_api_key").is_file():
+                    self.brain.save_api_key(legacy_key)
+                self.config["llm"].pop("api_key", None)
+                self.save_config()
+                log("API Key 已从 config.json 移到 pet/.secret_api_key")
+            except Exception as exc:
+                log(f"迁移 API Key 失败：{exc}")
+        elif isinstance(self.config.get("llm"), dict):
+            self.config["llm"].pop("api_key", None)  # 空字段也不留，免得以后有人顺手填进去
+        try:  # nn-3 语义召回：有本机向量模型就按意思想起事情，没有就只用关键词
+            from embedder import Embedder
+            store = self.brain.memory_store
+            embedder = Embedder(cache_path=store.path.with_name("memory.vectors.json"), log=log)
+            if embedder.available:
+                store.embedder = embedder
+                log("记忆：语义召回已开（本机向量模型）")
+            else:
+                log(f"记忆：语义召回没开：{embedder.reason}")
+        except Exception as exc:
+            log(f"记忆：语义召回加载失败：{exc}")
         try:
             # 记一次「自己身体的大致布局」，让模型点哪里时有自己的参考，而不是每次靠硬编码
             facts = self.brain.memory_store.facts
@@ -2176,8 +2139,22 @@ class PetApp:
         self.asr = ASR(language=self.config.get("asr_language", "zh-CN"), log=log,
                        backend=self.config.get("asr_backend", "whisper"),
                        model_dir=BASE.parent / ".tools" / "faster-whisper-small")
+        try:  # nn-1 本机耳朵（SenseVoice 听写 + 唤醒词），没有模型就退回 Whisper
+            from ears import Ears
+            self.ears = Ears(log=log)
+            if self.ears.can_transcribe:
+                self.asr.ears = self.ears
+            self.asr.on_heard = lambda heard: self.root.after(0, self._heard_tone, heard)
+        except Exception as exc:
+            self.ears = None
+            log(f"耳朵加载失败：{exc}")
         self.voice = VoiceEngine(self.root, ASSETS, CACHE, self.config, log=log,
                                  on_speaking=self._on_speaking)
+        self.voice.tone_provider = self._voice_tone
+        self._qwen_proc = None
+        if str(self.config.get("voice_backend") or "").lower() == "qwen3" and not self.hidden:
+            self.voice.qwen_warming_until = time.time() + 90  # 开机第一句也等她自己的嗓子，不先用晓伊
+        self.root.after(300, self._ensure_qwen_tts)
         self.wake_listener = None
         self.shared_server = None
         self.qq_bridge = None
@@ -2221,7 +2198,10 @@ class PetApp:
         self.stickers = StickerBook(ASSETS / "stickers")
         self.songbook = Songbook(ASSETS / "songs", log=log)
         self.douyin = DouyinBridge(log=log) if DouyinBridge else None
-        if self.douyin is not None:
+        # 抖音人设同步会写 ~/.dsh 下的 role-card：隐藏模式（冒烟）、临时配置时都不做（repo-3）
+        sync_douyin = ((self.config.get("douyin") or {}).get("sync_on_start", True)
+                       and not hidden and not os.environ.get("DFY_CONFIG"))
+        if self.douyin is not None and sync_douyin:
             try:
                 ok, message = self.douyin.sync_persona(BASE / "persona.md")
                 if ok:
@@ -2292,6 +2272,9 @@ class PetApp:
             self.root.after(2000, self.open_chat)
         self.root.after(15000, self._autonomy_tick)
         self.root.after(20 * 60 * 1000, self._self_improve_tick)
+        self.root.after(30 * 60 * 1000, self._home_improve_tick)
+        if os.environ.get("DFY_AUTONOMY_ONCE") == "1":
+            self.root.after(8000, self._autonomy_once_startup)
         self.root.after(60 * 1000, self._ambient_screen_tick)
         if not hidden and (self.config.get("wake") or {}).get("enabled"):
             self.root.after(2500, self.start_wake)
@@ -2426,10 +2409,29 @@ class PetApp:
                 log(f"打开总览 HTML 失败：{exc}")
 
     # ---------- Agent：帮她真的动手 ----------
-    def _confirm_tool(self, tool_name, args, preview) -> bool:
-        """在工作线程里等桌宠旁边的确认气泡；没有界面时一律拒绝。"""
-        if self.config.get("agent", {}).get("auto_approve"):
+    AUTO_APPROVE_MINUTES = 30
+
+    def _auto_approve_active(self) -> bool:
+        return time.time() < float(getattr(self, "_auto_approve_until", 0.0) or 0.0)
+
+    def _audit_auto_approve(self, tool_name, preview) -> None:
+        try:
+            path = DATA_DIR / "logs" / "auto-approve.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {tool_name}｜"
+                         + str(preview)[:400].replace("\n", " ") + "\n")
+        except OSError:
+            pass
+
+    def _confirm_tool(self, tool_name, args, preview, force: bool = False) -> bool:
+        """在工作线程里等桌宠旁边的确认气泡；没有界面时一律拒绝。
+
+        force=True（联网命令、读过网页后的改动等）即使开着全权限托管也要真人点头。
+        """
+        if not force and self._auto_approve_active():
             log(f"全权限托管：自动允许 {tool_name}｜{str(preview)[:160]}")
+            self._audit_auto_approve(tool_name, preview)
             return True
         result = {"ok": False}
         done = threading.Event()
@@ -2439,7 +2441,7 @@ class PetApp:
         def ask() -> None:
             try:
                 prompt = ApprovalPrompt(self, tool_name, preview,
-                                        lambda ok: (result.__setitem__("ok", bool(ok)), done.set()))
+                                        lambda ok: (result.__setitem__("ok", bool(ok)), done.set()), force=force)
                 self.approval_prompt = prompt
             except Exception as exc:
                 log(f"确认气泡拉起失败：{exc}")
@@ -2454,9 +2456,17 @@ class PetApp:
         return bool(finished and result["ok"])
 
     def live_context(self) -> str:
-        """「此刻」一行（≤70 字）：几点、她刚在干嘛、她的状态、主人在干嘛。让她像活在当下，而不是每次从零开始。"""
+        """「此刻」一行：几点、她在哪、刚在干嘛、状态、主人在干嘛。"""
         weekday = "一二三四五六日"[time.localtime().tm_wday]
         parts = [f"周{weekday} {time.strftime('%H:%M')}"]
+        heard = getattr(self, "_last_heard_tone", None)
+        if heard and time.time() - heard[1] < 600:  # 她听到的，不是主人说的事实
+            parts.append(f"你刚听到主人说话时{heard[0]}")
+        if self.config.get("position_awareness", True):
+            try:
+                parts.append(self._position_summary())
+            except Exception:
+                pass
         living = getattr(self, "living", None)
         if living is not None:
             doing = {"stroll": "在桌面上溜达", "climb_window": "爬到窗口顶上玩", "peek_edge": "躲在屏幕边偷看",
@@ -2464,6 +2474,8 @@ class PetApp:
                      "write_diary": "刚写完日记", "call_master": "刚在喊主人"}.get(living.activity)
             if doing:
                 parts.append(f"你{doing}")
+            # QQ 等来访者只看这份：时间 + 她自己在干嘛，不含主人前台窗口、提醒、心里话、抖音（app-interact-8）
+            self._visitor_context = "；".join(parts[:1] + ([f"你{doing}"] if doing else []))
             parts.append(f"你现在{living.state.summary()}")
             unsaid = living.state.pop_unsaid()  # 上一轮心里那一下，只告诉她一次
             if unsaid:
@@ -2492,7 +2504,30 @@ class PetApp:
                 parts.append(f"主人好像在{label}")
         except Exception:
             pass
-        return "；".join(parts)[:160]
+        return "；".join(parts)[:240]
+
+    def _position_changed(self) -> None:
+        """被放到新位置后，更新她自己的位置感；不额外调模型。"""
+        self._last_position_at = time.time()
+        try:
+            self.brain.live_context = self.live_context()
+        except Exception:
+            pass
+
+    def _position_summary(self) -> str:
+        """她自己知道此刻在屏幕的哪里，而不是只有 x/y。"""
+        x = int(self.root.winfo_x())
+        y = int(self.root.winfo_y())
+        sw = max(1, int(self.root.winfo_screenwidth()))
+        sh = max(1, int(self.root.winfo_screenheight()))
+        cx = x + self.W // 2
+        cy = y + self.H // 2
+        px, py = cx / sw, cy / sh
+        col = "左" if px < 0.34 else ("右" if px > 0.66 else "中")
+        row = "上" if py < 0.34 else ("下" if py > 0.66 else "中")
+        edge = min(x, y, sw - (x + self.W), sh - (y + self.H))
+        near = "贴着屏幕边" if edge < 80 else "离屏幕边还有距离"
+        return f"你现在在屏幕{col}{row}部（横向{px:.0%}、纵向{py:.0%}，{near}）"
 
     def _reminder_note(self, text: str) -> str:
         """主人让她提醒：先在本地把提醒排好，再告诉她结果（她就不会空口答应做不到的事）。"""
@@ -2685,6 +2720,7 @@ class PetApp:
                     self._start_flight(vx, vy)
                     return
             self._save_position()
+            self._position_changed()
             if self._living_on():
                 self.living.dropped()  # 放在半空会掉到下面的窗口或任务栏上
         else:
@@ -2815,7 +2851,7 @@ class PetApp:
         return str(self.config.get("display_name") or self.config.get("pet_name") or "大肥鱼")
 
     def save_config(self) -> None:
-        save_json(self.config_path, self.config)
+        save_config_file(self.config_path, self.config, self._config_defaults)  # 只写和默认值不同的项
 
     # ---------- 菜单 ----------
     def _build_menu(self) -> tk.Menu:
@@ -2838,7 +2874,7 @@ class PetApp:
                              command=self.toggle_quick_chat)
         self.wake_var = tk.BooleanVar(value=bool((self.config.get("wake") or {}).get("enabled")))
         chat.add_checkbutton(label="🎙  喊名字唤醒", variable=self.wake_var, command=self.toggle_wake)
-        self.ambient_screen_var = tk.BooleanVar(value=bool(self.config.get("ambient_screen_enabled", True)))
+        self.ambient_screen_var = tk.BooleanVar(value=bool(self.config.get("ambient_screen_enabled", False)))
         chat.add_checkbutton(label="👀  自己定期看你在干嘛", variable=self.ambient_screen_var,
                              command=self.toggle_ambient_screen)
         chat.add_separator()
@@ -2846,19 +2882,30 @@ class PetApp:
         chat.add_checkbutton(label="🔇  静音", variable=self.mute_var, command=self.toggle_mute)
         voice_menu = tk.Menu(chat, tearoff=0, font=("Microsoft YaHei", 9))
         current_voice = str(self.config.get("voice_backend") or "edge").lower()
-        if current_voice not in ("gptsovits", "gpt-sovits", "edge"):
+        if current_voice not in ("qwen3", "gptsovits", "edge"):
             current_voice = "edge"
         self.voice_backend_var = tk.StringVar(value=current_voice)
+        voice_menu.add_radiobutton(label="她自己的声音（本机 Qwen3-TTS，推荐）", variable=self.voice_backend_var,
+                                   value="qwen3", command=lambda: self.set_voice_backend("qwen3"))
         voice_menu.add_radiobutton(label="晓伊（在线系统音色）", variable=self.voice_backend_var,
                                    value="edge", command=lambda: self.set_voice_backend("edge"))
-        voice_menu.add_radiobutton(label="GPT-SoVITS（本地克隆）", variable=self.voice_backend_var,
+        voice_menu.add_radiobutton(label="GPT-SoVITS（旧，本地克隆）", variable=self.voice_backend_var,
                                    value="gptsovits", command=lambda: self.set_voice_backend("gptsovits"))
+        qwen_cfg = self.config.get("qwen_tts") if isinstance(self.config.get("qwen_tts"), dict) else {}
+        self.qwen_mix_var = tk.BooleanVar(value=float(qwen_cfg.get("mix_weight") or 0) > 0)
+        voice_menu.add_separator()
+        voice_menu.add_radiobutton(label="她的嗓子：v2 原版（角色卡声线，默认）", variable=self.qwen_mix_var,
+                                   value=False, command=lambda: self.set_qwen_mix(False))
+        voice_menu.add_radiobutton(label="她的嗓子：v2 + 30% Seed-VC（含晓伊音色，仅自用）", variable=self.qwen_mix_var,
+                                   value=True, command=lambda: self.set_qwen_mix(True))
         voice_menu.add_separator()
         voice_menu.add_command(label="🔊  试听现在的声音", command=self.test_voice)
         chat.add_cascade(label="🔊  说话声音", menu=voice_menu)
         asr_menu = tk.Menu(chat, tearoff=0, font=("Microsoft YaHei", 9))
-        self.asr_backend_var = tk.StringVar(value=str(self.config.get("asr_backend") or "whisper"))
-        asr_menu.add_radiobutton(label="本地 Whisper（推荐，离线）", variable=self.asr_backend_var,
+        self.asr_backend_var = tk.StringVar(value=str(self.config.get("asr_backend") or "sensevoice"))
+        asr_menu.add_radiobutton(label="本机 SenseVoice（推荐，听得出语气）", variable=self.asr_backend_var,
+                                 value="sensevoice", command=lambda: self.set_asr_backend("sensevoice"))
+        asr_menu.add_radiobutton(label="本地 Whisper（离线）", variable=self.asr_backend_var,
                                  value="whisper", command=lambda: self.set_asr_backend("whisper"))
         asr_menu.add_radiobutton(label="Google 在线识别", variable=self.asr_backend_var,
                                  value="google", command=lambda: self.set_asr_backend("google"))
@@ -2881,9 +2928,12 @@ class PetApp:
         home.add_command(label="📂  打开小窝文件夹", command=self.open_home)
         home.add_command(label="🧠  让她整理小屋/自省", command=self.reflect_home)
         home.add_command(label="🧬  自主进化（模型/Agent/能力/外形）…", command=self.autonomy_improve)
-        self.self_auto_var = tk.BooleanVar(value=bool(self.config.get("self_improve_autonomous")))
-        home.add_checkbutton(label="⏱  自动自主进化", variable=self.self_auto_var,
+        self.self_auto_var = tk.BooleanVar(value=bool(self.config.get("self_improve_model_enabled", False)))
+        home.add_checkbutton(label="🧬  模型/能力自主进化", variable=self.self_auto_var,
                              command=self.toggle_self_autonomy)
+        self.home_auto_var = tk.BooleanVar(value=bool(self.config.get("self_improve_home_enabled", False)))
+        home.add_checkbutton(label="🏠  小屋自主优化", variable=self.home_auto_var,
+                             command=self.toggle_home_autonomy)
         evo_menu = tk.Menu(home, tearoff=0, font=("Microsoft YaHei", 9))
         self.autonomy_model_var = tk.StringVar(
             value=str(self.config.get("autonomy_model") or "deepseek-v4-pro"))
@@ -2897,10 +2947,12 @@ class PetApp:
         model_menu.add_radiobutton(label="deepseek-flash（快/省）",
                                    variable=self.autonomy_model_var, value="deepseek-flash",
                                    command=lambda: self.set_autonomy_model("deepseek-flash"))
-        evo_menu.add_cascade(label="🧠 自主进化用的模型", menu=model_menu)
+        evo_menu.add_cascade(label="🧠 模型进化用的模型", menu=model_menu)
         evo_menu.add_separator()
-        evo_menu.add_command(label="⏱ 设置自主进化频率…", command=self.set_autonomy_interval)
+        evo_menu.add_command(label="⏱ 设置模型进化频率…", command=self.set_autonomy_interval)
+        evo_menu.add_command(label="⏱ 设置小屋优化频率…", command=self.set_home_interval)
         evo_menu.add_command(label="🎯 设置单轮 token 上限…", command=self.set_autonomy_round_limit)
+        evo_menu.add_command(label="🧱 设置单轮最大步数…", command=self.set_autonomy_steps)
         evo_menu.add_command(label="📅 设置每日 token 上限…", command=self.set_autonomy_limit)
         home.add_cascade(label="⚙️  自主进化设置", menu=evo_menu)
         home.add_separator()
@@ -2928,6 +2980,9 @@ class PetApp:
         self.topmost_var = tk.BooleanVar(value=bool(self.config.get("always_on_top", True)))
         look.add_checkbutton(label="📌  窗口置顶", variable=self.topmost_var,
                              command=self.toggle_topmost)
+        self.position_aware_var = tk.BooleanVar(value=bool(self.config.get("position_awareness", True)))
+        look.add_checkbutton(label="📍  让她知道自己在屏幕哪", variable=self.position_aware_var,
+                             command=self.toggle_position_awareness)
         self.body3d_var = tk.BooleanVar(value=False)
         if self.config.get("body3d_menu"):
             look.add_checkbutton(label="🧊  3D 身体（实验）", variable=self.body3d_var,
@@ -3046,8 +3101,7 @@ class PetApp:
             value=bool((self.config.get("proactive") or {}).get("enabled", True)))
         system.add_checkbutton(label="💬  允许主动搭话", variable=self.proactive_var,
                                command=self.toggle_proactive)
-        self.auto_approve_var = tk.BooleanVar(
-            value=bool((self.config.get("agent") or {}).get("auto_approve")))
+        self.auto_approve_var = tk.BooleanVar(value=self._auto_approve_active())
         system.add_checkbutton(label="🔓  全权限托管（危险）", variable=self.auto_approve_var,
                                command=self.toggle_auto_approve)
         system.add_separator()
@@ -3061,17 +3115,42 @@ class PetApp:
         self.bubble.show("静音啦。" if self.config["mute"] else "声音回来啦。", 1600)
 
     def set_voice_backend(self, backend: str) -> None:
-        backend = "gptsovits" if str(backend).lower() in ("gptsovits", "gpt-sovits") else "edge"
+        backend = str(backend).lower()
+        backend = backend if backend in ("qwen3", "gptsovits") else "edge"
         self.config["voice_backend"] = backend
         self.save_config()
         try:
             self.voice_backend_var.set(backend)
         except Exception:
             pass
-        if backend == "gptsovits":
+        if backend == "qwen3":
+            self._ensure_qwen_tts()
+            self.bubble.show("换成我自己的声音啦（本机 Qwen3-TTS，第一次要加载一会儿）；没开好时先用晓伊。", 4600)
+        elif backend == "gptsovits":
             self.bubble.show("声音切到 GPT-SoVITS；服务器没开时会自动回退晓伊。", 3800)
         else:
             self.bubble.show("声音切回晓伊（在线系统音色）。", 3000)
+
+    def set_qwen_mix(self, mix: bool) -> None:
+        """切换她的嗓子：v2 混 30% Seed-VC / v2 原版。要重启本机嗓子服务（约半分钟），期间说的话会等它。"""
+        cfg = self.config.setdefault("qwen_tts", {})
+        cfg["voice"] = "mingyue-v2"
+        cfg["mix_ref"] = "docs/seedvc-sample.wav"
+        cfg["mix_weight"] = 0.3 if mix else 0.0
+        self.save_config()
+        proc = getattr(self, "_qwen_proc", None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+        self._qwen_proc = None
+        if str(self.config.get("voice_backend") or "").lower() != "qwen3":
+            self.set_voice_backend("qwen3")
+        else:
+            self._ensure_qwen_tts()
+        self.bubble.show("换嗓子中……半分钟后用" + ("v2 混 Seed-VC 的声音" if mix else "v2 原版声音") + "说话。", 4200)
 
     def test_voice(self) -> None:
         try:
@@ -3081,7 +3160,8 @@ class PetApp:
             self.bubble.show("试听失败：" + str(exc)[:220], 4200)
 
     def set_asr_backend(self, backend: str) -> None:
-        backend = "google" if str(backend).lower() == "google" else "whisper"
+        backend = str(backend).lower()
+        backend = backend if backend in ("google", "whisper") else "sensevoice"
         self.config["asr_backend"] = backend
         try:
             self.asr.backend = backend
@@ -3092,7 +3172,8 @@ class PetApp:
             self.asr_backend_var.set(backend)
         except Exception:
             pass
-        self.bubble.show("听写切到：" + ("本地 Whisper" if backend == "whisper" else "Google 在线"), 2600)
+        self.bubble.show("听写切到：" + {"whisper": "本地 Whisper", "google": "Google 在线",
+                                           "sensevoice": "本机 SenseVoice"}[backend], 2600)
 
     def toggle_voice_backend(self) -> None:
         use_new = bool(self.gptsovits_var.get())
@@ -3100,6 +3181,13 @@ class PetApp:
         self.save_config()
         self.bubble.show("以后用她的 GPT-SoVITS 声音说话。" if use_new
                          else "先用回晓伊声音（GPT-SoVITS 服务器可留着）。", 3600)
+
+    def toggle_position_awareness(self) -> None:
+        enabled = bool(self.position_aware_var.get())
+        self.config["position_awareness"] = enabled
+        self.save_config()
+        self.bubble.show("好，我会记得自己在屏幕的哪边。" if enabled
+                         else "好，先不记位置了。", 3000)
 
     def toggle_topmost(self) -> None:
         value = bool(self.topmost_var.get())
@@ -3304,7 +3392,7 @@ class PetApp:
 
     def _speak_preset(self, text: str, path) -> None:
         """GPT-SoVITS 模式跳过旧晓伊预合成，用新音色重合成。"""
-        if str(self.config.get("voice_backend") or "").lower() == "gptsovits":
+        if str(self.config.get("voice_backend") or "").lower() in ("gptsovits", "qwen3"):
             self.voice.speak(text)
         else:
             self.voice.speak(preset=path)
@@ -3684,6 +3772,17 @@ class PetApp:
         self.save_config()
         self.bubble.show("单轮上限设为 " + ("不限" if value <= 0 else f"{value} token"), 3600)
 
+    def set_autonomy_steps(self) -> None:
+        value = self._ask_token_int(
+            "单轮最大步数", "一轮自主进化最多用多少步？（1–80；大文件改动可以调高）",
+            int(self.config.get("autonomy_max_steps", 24) or 24))
+        if value is None:
+            return
+        value = max(1, min(80, int(value)))
+        self.config["autonomy_max_steps"] = value
+        self.save_config()
+        self.bubble.show(f"单轮最多 {value} 步；大文件可以用 replace_in_file 局部改。", 3800)
+
     def set_autonomy_interval(self) -> None:
         value = self._ask_token_int("自主进化频率", "每多少分钟自己进化一次？（10–1440）",
                                     int(self.config.get("self_improve_interval_min", 30) or 30))
@@ -3693,6 +3792,22 @@ class PetApp:
         self.config["self_improve_interval_min"] = value
         self.save_config()
         self.bubble.show(f"以后每 {value} 分钟自主进化一次。", 3600)
+
+    def set_home_interval(self) -> None:
+        value = self._ask_token_int("小屋优化频率", "每多少分钟整理一次小屋？（10–1440）",
+                                    int(self.config.get("self_improve_home_interval_min", 60) or 60))
+        if value is None:
+            return
+        value = max(10, min(1440, int(value)))
+        self.config["self_improve_home_interval_min"] = value
+        self.save_config()
+        self.bubble.show(f"以后每 {value} 分钟整理一次小屋。", 3600)
+
+    def toggle_home_autonomy(self) -> None:
+        enabled = bool(self.home_auto_var.get())
+        self.config["self_improve_home_enabled"] = enabled
+        self.save_config()
+        self.bubble.show("小屋自主优化开着。" if enabled else "小屋先不由她自己整理。", 3000)
 
     def set_autonomy_model(self, model: str) -> None:
         self.config["autonomy_model"] = str(model or "")
@@ -3734,11 +3849,10 @@ class PetApp:
 
     # ---------- 通到 QQ（OneBot HTTP） ----------
     def _qq_reply(self, text: str) -> str:
-        note = self._reminder_note(text)  # QQ 里让她提醒也算数（到点在桌面上提醒）
-        if note:
-            self.brain.live_context = self.live_context() + "；" + note
+        """在 QQ 桥的线程里跑：不碰 Tk、不建桌面提醒、不消费她的心里话；只给来访者版的【此刻】。"""
+        context = getattr(self, "_visitor_context", "") or time.strftime("%H:%M")
         try:
-            reply, source = self.brain.reply(text)
+            reply, source = self.brain.reply(text, live_context=context)
         except Exception as exc:
             log(f"QQ 聊天失败：{exc}")
             return "呜……本鲸刚刚走神了，再说一遍嘛。"
@@ -4037,15 +4151,29 @@ class PetApp:
         self.root.after(9000, self._roam_tick)
 
     def toggle_auto_approve(self) -> None:
-        cfg = self.config.setdefault("agent", {})
-        enabled = bool(self.auto_approve_var.get())
-        cfg["auto_approve"] = enabled
-        self.save_config()
-        if enabled:
-            self.bubble.show("⚠ 全权限托管开了：她以后动电脑不再问你。"
-                             "本鲸会记到日志里，想收回随时关掉。", 7000)
-        else:
+        """全权限托管：只在这次运行里有效，30 分钟自动关，不写进 config.json。"""
+        if not bool(self.auto_approve_var.get()):
+            self._auto_approve_until = 0.0
             self.bubble.show("全权限托管关了，动手前会再问你。", 3000)
+            return
+        from tkinter import messagebox
+        ok = messagebox.askyesno(
+            "开启全权限托管？",
+            f"接下来 {self.AUTO_APPROVE_MINUTES} 分钟里，她改文件、跑命令都不再问你。\n\n"
+            "联网/安装/推送类命令、读过网页之后的改动，仍然会弹窗问你。\n"
+            "每次自动放行都会记到 logs/auto-approve.log。\n\n确定开启吗？",
+            icon="warning", default="no")
+        if not ok:
+            self.auto_approve_var.set(False)
+            return
+        self._auto_approve_until = time.time() + self.AUTO_APPROVE_MINUTES * 60
+        self.root.after(self.AUTO_APPROVE_MINUTES * 60 * 1000 + 500, self._auto_approve_expire)
+        self.bubble.show(f"⚠ 全权限托管开了 {self.AUTO_APPROVE_MINUTES} 分钟，到点自动关。", 6000)
+
+    def _auto_approve_expire(self) -> None:
+        if not self._auto_approve_active() and bool(self.auto_approve_var.get()):
+            self.auto_approve_var.set(False)
+            self.bubble.show("全权限托管到时间了，已自动关掉。", 3600)
 
     def show_memory(self) -> None:
         """记忆窗口：记得的事（可删/调重要度）、日记、心情、最近一次召回、饭量、提醒。"""
@@ -4075,14 +4203,27 @@ class PetApp:
             log(f"自主小动作失败：{exc}")
         self.root.after(15000, self._autonomy_tick)
 
+    def _autonomy_once_startup(self) -> None:
+        log("DFY_AUTONOMY_ONCE：启动一次自主进化")
+        topic = str(os.environ.get("DFY_AUTONOMY_TOPIC") or "").strip() or None
+        if topic:
+            log(f"DFY_AUTONOMY_TOPIC：{topic}")
+        threading.Thread(target=self._autonomy_self_improve_worker,
+                         args=(topic,), daemon=True).start()
+
     def _self_improve_tick(self) -> None:
-        if self.config.get("self_improve_enabled", True):
-            if self.config.get("self_improve_autonomous"):
-                threading.Thread(target=self._autonomy_self_improve_worker, daemon=True).start()
-            else:
-                threading.Thread(target=self._self_improve_worker, daemon=True).start()
+        """模型/能力自主进化：单独计时，不和小屋整理混在一起。"""
+        if self.config.get("self_improve_enabled", False) and self.config.get("self_improve_model_enabled", False):
+            threading.Thread(target=self._autonomy_self_improve_worker, daemon=True).start()
         minutes = max(10, int(self.config.get("self_improve_interval_min", 30) or 30))
         self.root.after(minutes * 60 * 1000, self._self_improve_tick)
+
+    def _home_improve_tick(self) -> None:
+        """小屋自主优化：只整理小屋/相处笔记，不碰代码和模型。"""
+        if self.config.get("self_improve_enabled", False) and self.config.get("self_improve_home_enabled", False):
+            threading.Thread(target=self._self_improve_worker, daemon=True).start()
+        minutes = max(10, int(self.config.get("self_improve_home_interval_min", 60) or 60))
+        self.root.after(minutes * 60 * 1000, self._home_improve_tick)
 
     def _autonomy_self_improve_worker(self, topic: str | None = None) -> None:
         """让她自己上网查、改自己的代码/2D/3D/声音/小屋，并用测试保护。"""
@@ -4091,12 +4232,12 @@ class PetApp:
         if getattr(self, "_autonomy_busy", False):
             return
         topics = {
-            "Agent 能力/工具/权限": "读 pet/agent.py、brain.py 和工具定义，自己想一个能真正增强你能力的小改动（新工具、工具描述、循环/错误恢复、权限边界），实现并测试。",
-            "语音模型/声音/听写": "检查 pet/voice.py、asr.py、config 中的声音/听写后端，必要时上网找更好的本地模型或参数，做一个可验证的改进。",
-            "外形/2D/3D/动作": "看看 2D 角色包、body3d、动画/表情/镜头，优化你自己的外形、动作或待机表现；能跑 smoke 就验证。",
-            "大脑/记忆/人格": "读 brain.py、persona、memory 和最近的相处记录，改进你的记忆、说话方式或自我认知；改完跑测试。",
-            "启动/性能/桌面体验": "看看启动流程、卡顿、窗口/托盘/菜单，挑一个实际的性能和体验问题修掉。",
-            "小屋/生活/活人感": "看看 pet/home、生活状态、看屏幕和主动行为，让你更像有自己的生活，但不刷屏。",
+            "Agent 能力/工具/权限": "只做一个很小的能力改进：给 pet/agent.py 的 replace_in_file 补一个 unittest（写到 pet/tests/test_agent.py），然后跑 pytest。只读这两个文件，20 步内完成。",
+            "语音模型/声音/听写": "检查 pet/asr.py 的本地 Whisper 路径/失败回退，补一个可验证的小测试或修一个真实小问题；只读相关文件，20 步内完成。",
+            "外形/2D/3D/动作": "只调整一个很小的外形/动作表现（例如某个动画时长或状态映射），跑相关测试；不要重写素材，20 步内完成。",
+            "大脑/记忆/人格": "只改进一个很小的记忆/说话行为，并补一个测试；只读相关文件，20 步内完成。",
+            "启动/性能/桌面体验": "只修一个可复现的小启动/性能/菜单问题，跑测试；只读相关文件，20 步内完成。",
+            "屏幕位置感/活人感": "只改进一处位置感或活人感行为：优先修改 _position_summary/live_context 附近，并补一个可验证测试；只读相关文件，20 步内完成。",
         }
         chosen = topic or random.choice(list(topics))
         goal = topics.get(chosen, topics["Agent 能力/工具/权限"])
@@ -4112,6 +4253,9 @@ class PetApp:
                 f"自主进化今天已经用了 {spent} token，达到/接近上限 {limit}；明天再继续。", 5200))
             return
         self._autonomy_busy = True
+        if self.config.get("autonomy_use_subprocess", True):
+            self._launch_autonomy_subprocess(chosen)
+            return
         try:
             prompt = (
                 "你是小鲸鱼，主人已明确给你很高的自主权限：你可以优化你自己的模型、Agent、功能、能力、外形、"
@@ -4124,28 +4268,98 @@ class PetApp:
                 "但绝不能读或写 API Key、token、密钥字段。\n"
                 f"这一轮先选一个具体、能验证的目标：{goal}\n"
                 "流程：\n"
-                "1) 先读 AGENTS.md、docs/STATUS.md、相关代码和最近记忆，判断真实缺口；需要时先上网查。\n"
+                "1) 先读 pet/home/SELF_DIRECTION.md 和最多两个目标文件；不要读整个项目，不要先读 AGENTS/STATUS 全文。\n"
                 "2) 改之前把要改的文件备份到 pet/home/backups/ 下一个带时间戳的目录；一轮只做一个可验证的改动。\n"
-                "3) 改完必须跑相关测试（优先 python -m pytest -q pet/tests；3D 用 body3d 的 smoke）。\n"
+                "3) 第 8 步前必须用 replace_in_file 写一次；第 20 步前必须跑相关测试；不要连续只读。\n"
                 "4) 如果失败，用备份恢复并如实报告；不要改测试来假装通过。\n"
                 "5) 绝对不要读/改 个人配置、密钥文件、其他个人数据；不要外发、不要 git push、"
                 "不要删除项目以外的东西；不要为了通过测试削弱安全/隐私边界。\n"
-                "6) 最后用中文写 5~10 行：你给自己加了什么能力、改了哪些文件、怎么验证、下一步想做什么。"
+                "6) 本轮不要调用 get_work_overview / read_personal_library / get_dsh_status，这些又慢又和本次改动无关。\n"
+                "7) 最后用中文写 5~10 行：你给自己加了什么能力、改了哪些文件、怎么验证、下一步想做什么。\n"
+                "效率要求：不要一次读整个文件；先用 search_files 定位，再用 read_file 只读相关段。"
+                "改代码优先用 replace_in_file；大文件（比如 app.py）只改局部，不要整文件重写。"
+                "最多 24 步，本轮目标必须在 20 步内完成。"
             )
-            result = self.agent.run(prompt, purpose="self_improve",
-                                    model=(str(self.config.get("autonomy_model") or "").strip() or None))
+            from agent import AgentRunner
+            import copy
+            cfg = copy.deepcopy(self.config)
+            cfg.setdefault("agent", {})["allowed_roots"] = [str(BASE.parent)]
+            runner = AgentRunner(BASE, cfg, personal=None, overview=None,
+                                 status_path=self._status_path(), log=log,
+                                 confirm=safety.autonomy_confirm(BASE.parent, cfg.get("autonomy_writable_modules")))
+            runner.disabled_tools = {"web_search", "web_fetch", "read_personal_library", "get_work_overview"}
+            runner.memory = self.brain
+            result = runner.run(
+                prompt, purpose="self_improve",
+                model=(str(self.config.get("autonomy_model") or "").strip() or None),
+                max_steps=int(self.config.get("autonomy_max_steps", 24) or 24),
+                on_step=lambda step: log(f"自主进化步骤 {step.get('tool')}：{str(step.get('detail') or '')[:120]}"))
             reply = str((result or {}).get("reply") or "").strip()
             steps = (result or {}).get("steps") or []
+            mutated = any(str(s.get("tool") or "") in ("write_file", "replace_in_file")
+                          and s.get("ok") for s in steps)
             if reply:
                 save_note(home_root(BASE), "notes", reply, title=f"自主优化：{chosen}")
-            self.root.after(0, lambda: self.bubble.show(
-                f"自主优化完成（{chosen}），报告写在小屋 notes 里。", 4600))
-            log(f"自主优化 {chosen}：{len(steps)} 步；{reply[:160]}")
+            if mutated:
+                msg = f"自主优化完成（{chosen}），报告写在小屋 notes 里。"
+            else:
+                msg = f"这轮自主优化只读没写（{chosen}），原因已记下，下一轮换小目标。"
+            self.root.after(0, lambda: self.bubble.show(msg, 5000))
+            log(f"自主优化 {chosen}：{len(steps)} 步；写入={mutated}；{reply[:160]}")
         except Exception as exc:
             log(f"自主优化失败：{exc}")
             self.root.after(0, lambda: self.bubble.show("这次自主优化卡住了：" + str(exc)[:220], 5200))
         finally:
             self._autonomy_busy = False
+
+    def _launch_autonomy_subprocess(self, topic: str) -> None:
+        """在独立进程跑自主进化：不阻塞桌宠，也不让长工具链卡住 GUI。"""
+        import subprocess
+        import sys
+
+        script = BASE.parent / "tools" / "autonomy_runner.py"
+        if not script.is_file():
+            self._autonomy_busy = False
+            self.bubble.show("自主进化脚本不在，暂时跑不了。", 3600)
+            return
+        log_dir = BASE / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        out_path = log_dir / "autonomy-runner.log"
+        out = open(out_path, "a", encoding="utf-8")
+        out.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {topic} =====\n")
+        out.flush()
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(script), topic],
+                cwd=str(BASE.parent), env=env, stdin=subprocess.DEVNULL,
+                stdout=out, stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as exc:
+            out.close()
+            self._autonomy_busy = False
+            log(f"自主进化子进程启动失败：{exc}")
+            self.bubble.show("自主进化进程没启动起来：" + str(exc)[:220], 4800)
+            return
+        out.close()
+        log(f"自主进化子进程：{topic}（pid={proc.pid}，日志 {out_path.name}）")
+
+        def wait() -> None:
+            try:
+                rc = proc.wait(timeout=900)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                rc = -1
+            self._autonomy_busy = False
+            self.root.after(0, lambda: self.bubble.show(
+                f"自主进化跑完了一轮（{topic}，退出码 {rc}），详情在小屋 notes/日志。", 5200))
+            log(f"自主进化子进程结束：{topic} rc={rc}")
+
+        threading.Thread(target=wait, daemon=True).start()
 
     def autonomy_improve(self) -> None:
         if self.agent is None:
@@ -4157,12 +4371,13 @@ class PetApp:
     def toggle_self_autonomy(self) -> None:
         enabled = bool(self.self_auto_var.get())
         self.config["self_improve_autonomous"] = enabled
+        self.config["self_improve_model_enabled"] = enabled
         self.save_config()
         if enabled:
             self.bubble.show("好，我每 30 分钟自己查资料、改一点自己的模型/能力/外形；token 不够会停。", 4600)
             threading.Thread(target=self._autonomy_self_improve_worker, daemon=True).start()
         else:
-            self.bubble.show("先不自己改了，等我叫你。", 2800)
+            self.bubble.show("模型/能力先不自己改了，等我叫你。", 2800)
 
     def _self_improve_worker(self) -> None:
         try:
@@ -4189,20 +4404,30 @@ class PetApp:
             self.bubble.show(f"打不开相处笔记：{exc}", 3000)
 
     def start_wake(self) -> None:
-        try:
-            from wake import WakeListener
-        except Exception as exc:
-            self.bubble.show(f"唤醒模块不可用：{exc}", 3000)
-            return
         cfg = self.config.get("wake") or {}
         if self.wake_listener is not None and self.wake_listener.running:
             return
-        self.wake_listener = WakeListener(
-            phrases=cfg.get("phrases") or ["大肥鱼", "肥鱼"],
-            language=cfg.get("language") or "zh-CN",
-            on_wake=self._on_wake,
-            log=log,
-        )
+        phrases = cfg.get("phrases") or ["大肥鱼", "肥鱼"]
+        ears = getattr(self, "ears", None)
+        if ears is not None and ears.available:
+            from ears import EarsWakeListener
+            self.wake_listener = EarsWakeListener(
+                ears, phrases, on_wake=self._on_wake_heard, log=log,
+                is_busy=lambda: bool(self._speaking or self.voice.busy()),
+                allow_short=bool(cfg.get("allow_short")))
+        elif cfg.get("online"):  # 只有主人明确允许，才用旧的在线识别（录音会发给 Google）
+            try:
+                from wake import WakeListener
+            except Exception as exc:
+                self.bubble.show(f"唤醒模块不可用：{exc}", 3000)
+                return
+            self.wake_listener = WakeListener(phrases=phrases, language=cfg.get("language") or "zh-CN",
+                                              on_wake=self._on_wake, log=log)
+        else:
+            reason = getattr(ears, "reason", "") or "本机耳朵没加载"
+            self.bubble.show(f"唤醒没开：{reason}", 5000)
+            log(f"唤醒没开：{reason}")
+            return
         ok, message = self.wake_listener.start()
         if not ok:
             self.bubble.show(f"唤醒没开成：{message}", 4000)
@@ -4221,8 +4446,9 @@ class PetApp:
         cfg["enabled"] = enabled
         self.save_config()
         if enabled:
-            self.bubble.show("开着唤醒啦：喊「大肥鱼」我就会应。麦克风会一直听，"
-                             "音频会发到在线识别；不想用随时关。", 6000)
+            local = getattr(self, "ears", None) is not None and self.ears.available
+            self.bubble.show("开着唤醒啦：喊「大肥鱼」我就会应。" + (
+                "全在本机识别，录音不出电脑。" if local else "（本机耳朵没装好，暂时开不了）"), 6000)
             self.start_wake()
         else:
             self.stop_wake()
@@ -4325,6 +4551,86 @@ class PetApp:
             os.startfile(str(path))
         except Exception as exc:
             self.bubble.show(f"打不开 PARTNER.md：{exc}", 2800)
+
+    def _on_wake_heard(self, command: str, heard=None) -> None:
+        if heard is not None:
+            self.root.after(0, self._heard_tone, heard)
+        self._on_wake(command)
+
+    def _heard_tone(self, heard) -> None:
+        """nn-2：SenseVoice 听出的语气/声音事件。记成「她听到的」，不当主人说的事实；笑和咳嗽有本地即时反应。"""
+        tone = getattr(heard, "tone", "")
+        if not tone:
+            return
+        self._last_heard_tone = (tone, time.time())
+        log(f"耳朵：主人{tone}")
+        event = getattr(heard, "event", "")
+        emotion = getattr(heard, "emotion", "")
+        try:
+            if event == "笑":
+                self._set_emotion("happy", duration_ms=2200)
+            elif event in ("咳嗽", "打喷嚏"):
+                self.bubble.show(random.choice(("（递纸巾）没事吧？", "多喝点热水……本鲸是认真的。",
+                                                "要不要歇一会儿？")), 3200)
+            elif emotion in ("难过", "生气") and not self._speaking:
+                self._set_emotion("shy" if emotion == "生气" else "sad", duration_ms=2600)
+        except Exception:
+            pass
+
+    def _voice_tone(self) -> str:
+        """说话时用哪种语气的嗓子（对应 pet/cache/voice/mingyue/ 里的参考音频）。"""
+        return {"happy": "happy", "proud": "happy", "surprised": "happy", "sad": "sad", "angry": "angry",
+                "shy": "shy"}.get(str(getattr(self, "_emotion", "") or ""), "neutral")
+
+    def _ensure_qwen_tts(self) -> None:
+        """voice_backend=qwen3 时，本机嗓子服务没开就在后台拉起来（GPU，首次加载约半分钟）。"""
+        if str(self.config.get("voice_backend") or "").lower() != "qwen3" or self.hidden:
+            return
+        if self._qwen_proc is not None and self._qwen_proc.poll() is None:
+            return
+
+        def worker() -> None:
+            import subprocess
+            import urllib.request
+            cfg = self.config.get("qwen_tts") or {}
+            url = str((cfg.get("base_url") if isinstance(cfg, dict) else "") or "http://127.0.0.1:9881").rstrip("/")
+            try:
+                with urllib.request.urlopen(url + "/health", timeout=2):
+                    return  # 已经有人开着
+            except Exception:
+                pass
+            root = BASE.parent
+            site = root / ".tools" / "fastqwen-venv" / "Lib" / "site-packages"  # 加速版（比实时快约 3 倍）
+            if not site.is_dir():
+                site = root / ".tools" / "qwen-tts-venv" / "Lib" / "site-packages"
+            script = root / "tools" / "qwen_tts_server.py"
+            voice_dir = CACHE / "voice" / (str((cfg.get("voice") if isinstance(cfg, dict) else "") or "mingyue"))
+            if not site.is_dir() or not script.is_file() or not (voice_dir / "voice.json").is_file():
+                log("本机嗓子：没装好（缺 qwen-tts venv 或参考音频），先用晓伊")
+                self.voice.qwen_warming_until = 0.0  # 不用等了
+                return
+            env = dict(os.environ, PYTHONPATH=str(site), PYTHONIOENCODING="utf-8",
+                       HF_HOME=str(root / ".tools" / "hf-cache"))
+            (BASE / "logs").mkdir(exist_ok=True)
+            out = open(BASE / "logs" / "qwen-tts.log", "a", encoding="utf-8")
+            try:  # 用主 python（venv 里复制出来的 python.exe 会被 Windows 的受控文件夹拦写入）
+                voice = str((cfg.get("voice") if isinstance(cfg, dict) else "") or "mingyue")
+                args = [sys.executable, "-X", "utf8", "-u", str(script), "--voice", voice]
+                if isinstance(cfg, dict) and cfg.get("mix_ref") and float(cfg.get("mix_weight") or 0) > 0:
+                    args += ["--mix-ref", str(cfg["mix_ref"]), "--mix-weight", str(float(cfg["mix_weight"]))]
+                self.voice.qwen_warming_until = time.time() + 90  # 启动期间说的话等它，不先用晓伊
+                self._qwen_proc = subprocess.Popen(
+                    args, cwd=str(root), env=env,
+                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                log(f"本机嗓子：Qwen3-TTS 服务启动中（pid={self._qwen_proc.pid}）")
+            except Exception as exc:
+                log(f"本机嗓子启动失败：{exc}")
+                self.voice.qwen_warming_until = 0.0
+            finally:
+                out.close()
+
+        threading.Thread(target=worker, name="qwen-tts-start", daemon=True).start()
 
     def _on_wake(self, command: str) -> None:
         log(f"被叫醒：{command or '（没听清后半句）'}")
@@ -4793,7 +5099,7 @@ class PetApp:
         win.geometry("520x250")
         win.attributes("-topmost", True)
         cfg = self.config.setdefault("vision", {})
-        tk.Label(win, text="OpenAI 兼容视觉模型（留空则只用前台窗口文字，不发送截图）",
+        tk.Label(win, text="备用视觉模型（看屏幕时压缩截图先发给当前聊天模型 DeepSeek；它看不了才用这里）",
                  font=("Microsoft YaHei", 10), anchor="w").pack(fill="x", padx=16, pady=(14, 6))
         form = tk.Frame(win)
         form.pack(fill="x", padx=16)
@@ -4832,9 +5138,30 @@ class PetApp:
         tk.Button(buttons, text="保存", width=10, command=save).pack(side="right")
         tk.Button(buttons, text="取消", width=10, command=win.destroy).pack(side="right", padx=8)
 
+    def _screen_blocked(self) -> str:
+        """所有可见窗口里有没有密码/银行/聊天/无痕这类：有就返回它的标题（senses-2）。"""
+        try:
+            import desktop
+            titles = desktop.visible_window_titles() or [desktop.foreground_title()]
+        except Exception:
+            titles = []
+        return safety.screen_has_sensitive(titles, self.config.get("screen_skip_titles"))
+
+    def _screen_bbox(self):
+        try:
+            import desktop
+            return desktop.foreground_monitor_rect()
+        except Exception:
+            return None
+
     def see_screen(self) -> None:
-        """截一张桌面 + 前台窗口，用她的口吻回应；截图只留在本机，按张数/时间清理。"""
-        path = capture_screen(DATA_DIR / "cache" / "screens", keep=4, max_age_hours=24)
+        """截前台显示器 + 前台窗口，用她的口吻回应；截图只留在本机，按张数/时间清理。"""
+        blocked = self._screen_blocked()
+        if blocked:
+            self.bubble.show(f"有敏感窗口开着（{blocked[:16]}…），本鲸不拍了。", 4200)
+            log(f"看屏幕：有敏感窗口开着（{blocked[:30]}），没截图")
+            return
+        path = capture_screen(DATA_DIR / "cache" / "screens", keep=4, max_age_hours=24, bbox=self._screen_bbox())
         ctx = screen_context()
         line = context_line(ctx)
         self.bubble.show("唔…本鲸瞄一眼。", 1800)
@@ -4854,8 +5181,8 @@ class PetApp:
                     "主人在做什么？屏幕上有什么值得注意的文字或界面？")
             except Exception:
                 description = ""
-            # 再回退本机 Claude Code CLI
-            if not description:
+            # 再回退本机 Claude Code CLI（会把原图交给第二家、还耗 Claude 额度：主人勾选 vision_allow_claude_cli 才用）
+            if not description and self.config.get("vision_allow_claude_cli"):
                 try:
                     description = claude_see(
                         path,
@@ -4906,7 +5233,7 @@ class PetApp:
                          else "好，我不偷看啦。", 3200)
 
     def _ambient_screen_tick(self) -> None:
-        if self.config.get("ambient_screen_enabled", True):
+        if self.config.get("ambient_screen_enabled", False) and not self.hidden:
             threading.Thread(target=self._ambient_screen_worker, daemon=True).start()
         interval = max(120, int(self.config.get("ambient_screen_interval", 300) or 300))
         self.root.after(interval * 1000, self._ambient_screen_tick)
@@ -4917,7 +5244,14 @@ class PetApp:
             return
         self._ambient_screen_busy = True
         try:
-            path = capture_screen(DATA_DIR / "cache" / "screens", keep=4, max_age_hours=24)
+            if not self.brain._llm_ready():  # 关了在线模型就绝不上传截图
+                return
+            blocked = self._screen_blocked()
+            if blocked:
+                log(f"定时看屏幕：有敏感窗口开着（{blocked[:30]}），跳过")
+                return
+            path = capture_screen(DATA_DIR / "cache" / "screens", keep=4, max_age_hours=24,
+                                  bbox=self._screen_bbox())
             if path is None:
                 return
             ctx = screen_context()
@@ -4931,15 +5265,7 @@ class PetApp:
                     "不要复述密码、密钥、聊天隐私全文。")
             except Exception:
                 description = ""
-            if not description:
-                try:
-                    description = claude_see(
-                        path,
-                        "简要客观描述这张屏幕截图里主人在做什么；不要复述隐私全文。",
-                        log=log)
-                except Exception:
-                    description = ""
-            if not description:
+            if not description:  # 定时看屏幕不回退 Claude CLI：不把截图再交给第二家
                 return
             import difflib
             previous = str(getattr(self, "_last_ambient_screen", "") or "")
@@ -5407,6 +5733,11 @@ class PetApp:
     def quit(self) -> None:
         try:
             self.living.save()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_qwen_proc", None) is not None and self._qwen_proc.poll() is None:
+                self._qwen_proc.terminate()
         except Exception:
             pass
         if getattr(self, "_body3d_proc", None) is not None:  # 3D 身体跟着一起关

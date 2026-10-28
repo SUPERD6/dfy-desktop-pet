@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""语音输入：麦克风录音 -> 本地 faster-whisper（失败回退 Google 在线识别）。
+"""语音输入：麦克风录音 -> 本机 SenseVoice（ears.Ears，顺带听出语气）-> 本机 faster-whisper。
 
-本地模型默认 .tools/faster-whisper-small；没有麦克风/没网时返回原因，不会让桌宠崩掉。
+只有 backend="google"（主人在菜单里选了在线识别）才把录音发给 Google；选本机时识别不出就如实说没听清。
+本地 Whisper 模型默认 .tools/faster-whisper-small；没有麦克风时返回原因，不会让桌宠崩掉。
 """
 from __future__ import annotations
 
@@ -22,6 +23,8 @@ class ASR:
         self.reason = ""
         self._whisper = None
         self._whisper_lock = threading.Lock()
+        self.ears = None       # ears.Ears：本机 SenseVoice（app 挂上）
+        self.on_heard = None   # (Heard) -> None：听出的语气/声音事件
         try:
             import speech_recognition as sr  # type: ignore
             self.sr = sr
@@ -91,11 +94,25 @@ class ASR:
             with sr.Microphone(**kwargs) as source:
                 recognizer.adjust_for_ambient_noise(source, duration=0.25)
                 audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_limit)
-            if self.backend in ("whisper", "local", "faster-whisper"):
+            if self.backend != "google":
+                # 本机优先：SenseVoice（带语气）→ Whisper。选了本机就绝不悄悄改用在线识别（录音不出电脑）
+                ears = getattr(self, "ears", None)
+                if ears is not None:
+                    try:
+                        heard = ears.transcribe_pcm16(audio.get_raw_data(convert_rate=16000, convert_width=2))
+                        if heard.text:
+                            if callable(getattr(self, "on_heard", None)):
+                                self.on_heard(heard)
+                            on_done(heard.text, None)
+                            return
+                    except Exception as exc:
+                        self.log(f"asr: SenseVoice 识别失败：{exc}")
                 text = self._transcribe_whisper(audio)
                 if text:
                     on_done(text, None)
                     return
+                on_done(None, "没听清，再说一遍嘛。")
+                return
             try:
                 text = recognizer.recognize_google(audio, language=self.language)
             except sr.UnknownValueError:

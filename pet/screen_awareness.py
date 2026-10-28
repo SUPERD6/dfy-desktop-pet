@@ -30,12 +30,15 @@ def cleanup_screens(out_dir: Path, keep: int = 5, max_age_hours: float = 24.0) -
 
 
 def capture_screen(out_dir: Path, all_screens: bool = True, keep: int = 5,
-                   max_age_hours: float = 24.0) -> Path | None:
-    """截取当前桌面，返回 PNG 路径；失败返回 None。每次顺手清理旧图。"""
+                   max_age_hours: float = 24.0, bbox: tuple | None = None) -> Path | None:
+    """截取桌面，返回 PNG 路径；失败返回 None。每次顺手清理旧图。
+
+    bbox 给出时只截这一块（默认调用方传前台窗口所在的显示器，不把别的屏幕拍进去）。
+    """
     try:
         from PIL import ImageGrab
 
-        image = ImageGrab.grab(all_screens=all_screens)
+        image = ImageGrab.grab(bbox=bbox, all_screens=True) if bbox else ImageGrab.grab(all_screens=all_screens)
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = out_dir / f"screen-{stamp}.png"
