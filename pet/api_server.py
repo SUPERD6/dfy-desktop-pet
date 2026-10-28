@@ -334,8 +334,37 @@ class _Handler(BaseHTTPRequestHandler):
         key = auth.replace("Bearer ", "", 1).strip() if auth.startswith("Bearer ") else auth.strip()
         return key == token or self.headers.get("x-api-key", "").strip() == token  # Anthropic 风格（DSH）用 x-api-key
 
+    # 浏览器发「简单请求」用的类型：没有预检就能跨站 POST，一律拒绝
+    SIMPLE_FORM_TYPES = ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data")
+
+    def _local_origins(self) -> set[str]:
+        port = self.server.server_address[1]
+        return {f"{host}:{port}" for host in ("127.0.0.1", "localhost", "[::1]")}
+
+    def _request_allowed(self, post: bool) -> bool:
+        """挡跨站与 DNS rebinding：Host 必须是本机地址；带 Origin 的必须是本机页面；不收表单类 POST。
+
+        本机 Node/Python 客户端（DSH、3D 身体、Anthropic SDK）不带 Origin，照常通过。
+        """
+        allowed = self._local_origins()
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host not in allowed:
+            self._send_json(403, {"error": {"message": "forbidden host", "type": "forbidden"}})
+            return False
+        origin = (self.headers.get("Origin") or "").strip().lower()
+        if origin and origin.split("://", 1)[-1] not in allowed:
+            self._send_json(403, {"error": {"message": "cross-origin request blocked", "type": "forbidden"}})
+            return False
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if post and ctype in self.SIMPLE_FORM_TYPES:
+            self._send_json(415, {"error": {"message": "use application/json", "type": "bad_request"}})
+            return False
+        return True
+
     # ---------- 路由 ----------
     def do_GET(self) -> None:  # noqa: N802
+        if not self._request_allowed(post=False):
+            return
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path in ("/", "/chat"):
             name = getattr(self.server, "display_name", "") or "大肥鱼"
@@ -390,6 +419,8 @@ class _Handler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._request_allowed(post=True):
+            return
         if not self._authorized():
             self._send_json(401, {"error": {"message": "invalid token", "type": "auth_error"}})
             return

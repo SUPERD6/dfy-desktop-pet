@@ -95,6 +95,15 @@ def trim_for_speech(text: str, limit: int = 90) -> str:
     return (text[:cut] if cut > 0 else text[:limit]) + "。"
 
 
+def qwen_voice_id(cfg) -> str:
+    """本机嗓子的音色标识（换音色或混合比例后缓存自动失效）。"""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    voice = str(cfg.get("voice") or "mingyue")
+    weight = float(cfg.get("mix_weight") or 0)
+    mix = f"+{Path(str(cfg.get('mix_ref'))).stem}{int(weight * 100)}" if cfg.get("mix_ref") and weight > 0 else ""
+    return f"{voice}{mix}-lock2"  # lock2：2026-10-28 按性格重做情绪参考 + 音高检查
+
+
 class VoiceEngine:
     """单线程播放队列：一次说一句，不会互相打断。"""
 
@@ -111,7 +120,13 @@ class VoiceEngine:
         self._mci = ctypes.windll.winmm.mciSendStringW
         self._alias = 0
         self._busy = threading.Event()
+        self._working = threading.Event()  # 正在合成或播放一句（合成阶段也算忙，免得麦克风在她开口前打开）
         self._cut = threading.Event()
+        # () -> "happy"/"sad"/"angry"/"shy"/"neutral"：说这句话时的心情（qwen3 嗓子按它换语气）
+        self.tone_provider = None
+        # 本机嗓子服务正在启动（加载模型约 15~40 秒）：这段时间等它，不拿晓伊顶上——
+        # 开机先晓伊、再换她自己的声音，主人会觉得「声音变了」（2026-10-28 反馈）
+        self.qwen_warming_until = 0.0
         self._preset_by_norm: dict[str, Path] = {}
         self._preset_by_text: dict[str, Path] = {}
         self._load_manifest()
@@ -159,18 +174,30 @@ class VoiceEngine:
         if not raw:
             return
         # 原文先试一次预合成（台词本身可能带「~」），没命中再念清洗后的文本
-        # GPT-SoVITS 模式下跳过旧晓伊预合成，否则常说的话仍是旧声音
-        use_presets = str(self.config.get("voice_backend") or "edge").lower() != "gptsovits"
-        if use_presets and (raw in self._preset_by_text or normalize(raw) in self._preset_by_norm):
-            self._queue.put(("text", raw))
+        # 换了嗓子（qwen3 / GPT-SoVITS）就跳过旧晓伊预合成，否则常说的话仍是旧声音
+        tone = self._current_tone()
+        if self._use_presets() and (raw in self._preset_by_text or normalize(raw) in self._preset_by_norm):
+            self._queue.put(("text", raw, tone))
             return
         spoken = trim_for_speech(clean_for_speech(raw), int(self.config.get("voice_max_chars") or 90))
         if spoken:
-            self._queue.put(("text", spoken))
+            self._queue.put(("text", spoken, tone))
+
+    def _backend(self) -> str:
+        return str(self.config.get("voice_backend") or "edge").strip().lower()
+
+    def _use_presets(self) -> bool:
+        return self._backend() == "edge"
+
+    def _current_tone(self) -> str:
+        try:
+            return str(self.tone_provider() or "neutral") if callable(self.tone_provider) else "neutral"
+        except Exception:
+            return "neutral"
 
     def busy(self) -> bool:
         """是否正在播放/合成一句话（给主动搭话、打断逻辑用）。"""
-        return self._busy.is_set() or not self._queue.empty()
+        return self._busy.is_set() or self._working.is_set() or not self._queue.empty()
 
     def stop(self) -> None:
         """丢掉排队中的句子，并让正在播的那句尽快停下。"""
@@ -191,20 +218,22 @@ class VoiceEngine:
             item = self._queue.get()
             if item is None:
                 return
-            kind, payload = item
+            kind, payload = item[0], item[1]
+            tone = item[2] if len(item) > 2 else "neutral"
             self._cut.clear()
+            self._working.set()
             try:
                 if kind == "play":
                     self._play(Path(payload))
                 elif kind == "text":
                     text = str(payload)
                     preset = None
-                    if str(self.config.get("voice_backend") or "edge").lower() != "gptsovits":
+                    if self._use_presets():
                         preset = self._preset_by_text.get(text) or self._preset_by_norm.get(normalize(text))
                     if preset is not None:
                         self._play(preset)
                     else:
-                        path = self._synthesize(text)
+                        path = self._synthesize(text, tone)
                         if path is not None:
                             self._play(path)
                         else:
@@ -214,16 +243,71 @@ class VoiceEngine:
             except Exception as exc:  # 播放失败不能把桌宠弄崩
                 self.log(f"voice error: {exc}")
             finally:
+                self._working.clear()
                 self._queue.task_done()
 
-    def _synthesize(self, text: str) -> Path | None:
-        backend = str(self.config.get("voice_backend") or "edge").strip().lower()
+    def _synthesize(self, text: str, tone: str = "neutral") -> Path | None:
+        backend = self._backend()
+        if backend in ("qwen3", "qwen3-tts", "qwen"):
+            path = self._synthesize_qwen(text, tone)
+            if path is None and time.time() < self.qwen_warming_until and self._wait_qwen_ready():
+                path = self._synthesize_qwen(text, tone)
+            if path is not None:
+                return path
+            self.log("voice: 本机嗓子（Qwen3-TTS）不可用，回退 edge-tts")
+            return self._synthesize_edge(text)
         if backend in ("gptsovits", "gpt-sovits", "so-vits"):
             path = self._synthesize_gptsovits(text)
             if path is not None:
                 return path
             self.log("voice: GPT-SoVITS 不可用，回退 edge-tts")
         return self._synthesize_edge(text)
+
+    def _qwen_url(self) -> str:
+        cfg = self.config.get("qwen_tts") or {}
+        return str((cfg.get("base_url") if isinstance(cfg, dict) else "") or "http://127.0.0.1:9881").rstrip("/")
+
+    def _wait_qwen_ready(self) -> bool:
+        """服务启动中：每秒看一次 /health，直到好了或过了启动窗口。"""
+        while time.time() < self.qwen_warming_until and not self._cut.is_set():
+            try:
+                with urllib.request.urlopen(self._qwen_url() + "/health", timeout=2) as response:
+                    if b'"ok": true' in response.read():
+                        return True
+            except Exception:
+                pass
+            time.sleep(1.0)
+        return False
+
+    def _synthesize_qwen(self, text: str, tone: str) -> Path | None:
+        """本机 Qwen3-TTS 服务（tools/qwen_tts_server.py）：她自己设计出来的音色，按心情换语气。"""
+        cfg = self.config.get("qwen_tts") or {}
+        base_url = self._qwen_url()
+        voice_id = qwen_voice_id(cfg)
+        if sum(1 for ch in text if ch.isalnum()) <= 4:
+            tone = "neutral"  # 短语气词服务端统一用平常语气挑最稳的一条；缓存也按同一条复用，每次听到都一样
+        key = hashlib.sha1(f"qwen|{voice_id}|{tone}|{text}".encode("utf-8")).hexdigest()
+        out = self.cache / f"tts_qw_{key}.wav"
+        if out.exists() and out.stat().st_size > 1024:
+            return out
+        body = json.dumps({"text": text, "tone": tone}, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(base_url + "/tts", data=body, method="POST",
+                                         headers={"Content-Type": "application/json"})
+        tmp = out.with_suffix(".part")
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                data = response.read()
+            if len(data) > 1024:
+                tmp.write_bytes(data)
+                tmp.replace(out)
+                return out
+        except Exception as exc:
+            self.log(f"voice: Qwen3-TTS 合成失败：{exc}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
 
     def _synthesize_gptsovits(self, text: str) -> Path | None:
         cfg = self.config.get("gptsovits") or {}

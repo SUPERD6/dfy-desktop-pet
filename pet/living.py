@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import random
 import threading
 import time
@@ -26,6 +27,44 @@ GRAVITY = 1800.0
 TEXT_SUFFIXES = {".py", ".md", ".txt", ".json", ".js", ".ts", ".tex", ".csv", ".yml", ".yaml", ".html", ".css"}
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "cache", "logs", ".ccx", "home"}
 SECRET_HINTS = ("secret", ".env", "token", "password", "credential", ".key", "id_rsa", "memory.json")
+# 她「翻文件」时绝不挑这些：运行状态和个人数据（片段会发给模型），以及备份（living-4）
+BROWSE_EXCLUDE = {"config.json", "life.json", "appetite.json", "reminders.json", "memory.json", "overview.json",
+                  "learned_notes.md", "partner.md", "工作总览.html", "memory.vectors.json", "voice.json"}
+_HEX_NAME = re.compile(r"^[0-9a-f]{32,}")
+
+
+def browse_excluded(name: str) -> bool:
+    low = name.lower()
+    return (low in BROWSE_EXCLUDE or ".bak" in low or low.startswith(".") or bool(_HEX_NAME.match(low))
+            or any(h in low for h in SECRET_HINTS))
+
+
+def browse_candidates(roots, cutoff: float, budget: int = 4000) -> list[tuple[float, Path]]:
+    """roots：[(目录, 最大深度)]。返回 [(修改时间, 路径)]，最近改过、文本、不在排除名单里的。"""
+    found: list[tuple[float, Path]] = []
+    for root, max_depth in roots:
+        stack = [(Path(root), 0)]
+        while stack and budget > 0:
+            folder, depth = stack.pop()
+            try:
+                entries = list(os.scandir(folder))
+            except OSError:
+                continue
+            for entry in entries:
+                budget -= 1
+                if browse_excluded(entry.name):
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth < max_depth and entry.name not in SKIP_DIRS:
+                            stack.append((Path(entry.path), depth + 1))
+                    elif Path(entry.name.lower()).suffix in TEXT_SUFFIXES:
+                        info = entry.stat()
+                        if info.st_mtime >= cutoff and info.st_size < 200_000:
+                            found.append((info.st_mtime, Path(entry.path)))
+                except OSError:
+                    continue
+    return found
 
 SNACK_LINES = ("嘿嘿，偷吃一口没人看见吧～", "肚子咕咕叫了，本鲸自己找点吃的。", "这块是本鲸藏的，不分给你。")
 CALL_LINES = ("主人～理理本鲸嘛。", "主人主人，你还在吗？", "本鲸好无聊，陪我说句话呗。", "（扯扯主人衣角）在忙吗？")
@@ -472,34 +511,16 @@ class Living:
                 self._say(tuple(line.format(label=label) for line in FG_LINES), 3200, voice=False)  # 主人在忙，不出声
 
     # ---------------------------------------------------------- 翻文件 / 写日记（后台线程）
+    def browse_roots(self) -> list[tuple[Path, int]]:
+        """能翻的目录：默认只有项目的 docs/、topics/ 和 pet/ 顶层源码，不翻个人规则目录（life.browse_roots 可改）。"""
+        project = Path(__file__).resolve().parent.parent
+        custom = self.cfg.get("browse_roots")
+        if isinstance(custom, list) and custom:
+            return [(Path(os.path.expandvars(os.path.expanduser(str(p)))), 3) for p in custom]
+        return [(project / "docs", 2), (project / "topics", 3), (project / "pet", 0)]
+
     def pick_recent_file(self) -> Path | None:
-        roots = (self.app.config.get("agent") or {}).get("allowed_roots") or []
-        cutoff = time.time() - 3 * 86400
-        found: list[tuple[float, Path]] = []
-        budget = 4000
-        for root in roots:
-            stack = [(Path(os.path.expandvars(os.path.expanduser(str(root)))), 0)]
-            while stack and budget > 0:
-                folder, depth = stack.pop()
-                try:
-                    entries = list(os.scandir(folder))
-                except OSError:
-                    continue
-                for entry in entries:
-                    budget -= 1
-                    name = entry.name.lower()
-                    if name.startswith(".") or any(h in name for h in SECRET_HINTS):
-                        continue
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            if depth < 3 and entry.name not in SKIP_DIRS:
-                                stack.append((Path(entry.path), depth + 1))
-                        elif Path(name).suffix in TEXT_SUFFIXES:
-                            info = entry.stat()
-                            if info.st_mtime >= cutoff and info.st_size < 200_000:
-                                found.append((info.st_mtime, Path(entry.path)))
-                    except OSError:
-                        continue
+        found = browse_candidates(self.browse_roots(), time.time() - 3 * 86400)
         if not found:
             return None
         found.sort(reverse=True)

@@ -23,6 +23,14 @@ CONFIG = {
     "llm": {"enabled": False, "api_key": ""},
     "proactive": {"enabled": False},
     "dsh_status": {"enabled": True, "path": str(STATUS), "poll_ms": 250},
+    # 不碰外部：不占 8765、不起托盘和全局快捷键、不开麦、不开公众号/QQ（repo-3）
+    "server": {"enabled": False},
+    "tray_enabled": False,
+    "hotkeys_enabled": False,
+    "wake": {"enabled": False},
+    "wechat": {"enabled": False},
+    "qq": {"enabled": False},
+    "voice_backend": "edge",
 }
 CONFIG_PATH = TMP / "config.json"
 CONFIG_PATH.write_text(json.dumps(CONFIG, ensure_ascii=False), encoding="utf-8")
@@ -31,6 +39,23 @@ os.environ["DFY_DATA_DIR"] = str(TMP)  # 饭量账本、生活状态、小窝都
 
 sys.path.insert(0, str(PET))
 import app as petapp  # noqa: E402
+
+
+def _stamp(path: Path):
+    try:
+        st = path.stat()
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _pet_running() -> bool:
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8765/health", timeout=1):
+            return True
+    except Exception:
+        return False
 
 
 def write_status(state: str, **extra) -> None:
@@ -58,8 +83,13 @@ def main() -> int:
     # 正在运行的桌宠会写 life.json / memory.json，这两个不在这里比，改为下面「临时目录里有」的正向检查
     real_files = [PET / name for name in ("config.json", "appetite.json")]
     real_before = {f: (f.read_bytes() if f.exists() else None) for f in real_files}
-    log_path = PET / "logs" / "app.log"
-    log_offset = log_path.stat().st_size if log_path.exists() else 0  # 只看这次运行新写的日志
+    # 正在运行的桌宠也会写这些，所以只在桌宠没开时比（开着时它自己改，比了会误报）
+    pet_running = _pet_running()
+    watched = [PET / "memory.json", PET / "learned_notes.md", PET / "logs" / "app.log",
+               Path.home() / ".dsh" / "douyin-browser" / "memory" / "persona" / "role-card.md"]
+    watched_before = {f: _stamp(f) for f in watched}
+    log_path = TMP / "logs" / "app.log"  # 日志写临时目录
+    log_offset = 0
     application = petapp.PetApp(hidden=True, demo=False)
     errors: list[str] = []
 
@@ -116,6 +146,13 @@ def main() -> int:
         if (f.read_bytes() if f.exists() else None) != before:
             errors.append(f"冒烟测试改动了真实的 pet/{f.name}（应只写临时目录）")
             print(errors[-1])
+    if not pet_running:
+        for f, before in watched_before.items():
+            if _stamp(f) != before:
+                errors.append(f"冒烟测试改动了真实文件：{f}（应只写临时目录）")
+                print(errors[-1])
+    else:
+        print("（桌宠正在运行：跳过 memory/日志等文件的改动检查，它们由运行中的桌宠在写）")
     for name in ("appetite.json",):  # life.json 要正常退出才存盘，冒烟是直接销毁窗口
         if not (TMP / name).exists():
             errors.append(f"{name} 没写进临时目录（DFY_DATA_DIR 没生效）")
